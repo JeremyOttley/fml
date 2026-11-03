@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 
 	"fml/internal/ir"
@@ -233,13 +234,16 @@ func EmitGoSource(prog *ir.Program) ([]byte, error) {
 	buf.WriteByte('\n')
 
 	// Emit direct compiled Go instruction evaluator `evalAOT` with TCO jump loop
+	// and unboxed scalar specialization (`int64`, `float64`, `bool`).
 	selfTailCalls := analyzeSelfTailCalls(prog)
+	scalars := analyzeAOTScalars(prog)
+	emitAOTScalarHelpers(&buf)
 	buf.WriteString("func evalAOT(vm *runtime.VM, id ir.InstrID, env map[token.StringID]runtime.Value) (runtime.Value, error) {\n")
 	buf.WriteString("tcoLoop:\n")
 	buf.WriteString("\tfor {\n")
 	buf.WriteString("\t\tswitch id {\n")
 	for i, ins := range prog.Instrs {
-		emitCompiledCase(&buf, prog, ir.InstrID(i), ins, selfTailCalls)
+		emitCompiledCase(&buf, prog, ir.InstrID(i), ins, selfTailCalls, scalars)
 	}
 	buf.WriteString("\t\tdefault:\n")
 	buf.WriteString("\t\t\treturn runtime.Unit, nil\n")
@@ -443,7 +447,650 @@ func collectFunctionBodyInstrs(prog *ir.Program, id ir.InstrID, visited map[ir.I
 	}
 }
 
-func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir.IRInstr, selfTailCalls map[ir.InstrID]*selfTailCallInfo) {
+type scalarKind uint8
+
+const (
+	scalarUnknown scalarKind = iota
+	scalarInt
+	scalarFloat
+	scalarBool
+	scalarString
+	scalarConflict
+)
+
+func joinScalar(a, b scalarKind) scalarKind {
+	if a == scalarUnknown {
+		return b
+	}
+	if b == scalarUnknown {
+		return a
+	}
+	if a == b {
+		return a
+	}
+	return scalarConflict
+}
+
+type aotScalarInfo struct {
+	instr    []scalarKind
+	def      map[ir.InstrID]scalarKind
+	varDef   map[ir.InstrID]ir.InstrID
+	storeDef map[ir.InstrID]ir.InstrID
+}
+
+func emitAOTScalarHelpers(buf *bytes.Buffer) {
+	buf.WriteString("func aotLoadInt(vm *runtime.VM, env map[token.StringID]runtime.Value, sym token.StringID) int64 {\n")
+	buf.WriteString("\tif v, ok := env[sym]; ok {\n")
+	buf.WriteString("\t\tif iv, ok := runtime.Deref(v).(runtime.IntVal); ok {\n")
+	buf.WriteString("\t\t\treturn iv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif v, ok := vm.Globals[sym]; ok {\n")
+	buf.WriteString("\t\tif iv, ok := runtime.Deref(v).(runtime.IntVal); ok {\n")
+	buf.WriteString("\t\t\treturn iv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\treturn 0\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString("func aotLoadFloat(vm *runtime.VM, env map[token.StringID]runtime.Value, sym token.StringID) float64 {\n")
+	buf.WriteString("\tif v, ok := env[sym]; ok {\n")
+	buf.WriteString("\t\tif fv, ok := runtime.Deref(v).(runtime.FloatVal); ok {\n")
+	buf.WriteString("\t\t\treturn fv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif v, ok := vm.Globals[sym]; ok {\n")
+	buf.WriteString("\t\tif fv, ok := runtime.Deref(v).(runtime.FloatVal); ok {\n")
+	buf.WriteString("\t\t\treturn fv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\treturn 0\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString("func aotLoadBool(vm *runtime.VM, env map[token.StringID]runtime.Value, sym token.StringID) bool {\n")
+	buf.WriteString("\tif v, ok := env[sym]; ok {\n")
+	buf.WriteString("\t\tif bv, ok := runtime.Deref(v).(runtime.BoolVal); ok {\n")
+	buf.WriteString("\t\t\treturn bv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif v, ok := vm.Globals[sym]; ok {\n")
+	buf.WriteString("\t\tif bv, ok := runtime.Deref(v).(runtime.BoolVal); ok {\n")
+	buf.WriteString("\t\t\treturn bv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\treturn false\n")
+	buf.WriteString("}\n\n")
+}
+
+// analyzeAOTScalars resolves lexical variable bindings and performs fixed-point
+// scalar type propagation across prog so pure int64, float64, and bool arithmetic
+// and comparison trees can be emitted as unboxed native Go expressions.
+func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
+	info := &aotScalarInfo{
+		instr:    make([]scalarKind, len(prog.Instrs)),
+		def:      make(map[ir.InstrID]scalarKind),
+		varDef:   make(map[ir.InstrID]ir.InstrID),
+		storeDef: make(map[ir.InstrID]ir.InstrID),
+	}
+	if prog == nil || len(prog.Instrs) == 0 || prog.Root == ir.NoInstr {
+		return info
+	}
+
+	resolveLexicalDefs(prog, prog.Root, make(map[token.StringID]ir.InstrID), info, make(map[ir.InstrID]bool))
+
+	type fnSig struct {
+		paramDefs []ir.InstrID
+		bodyID    ir.InstrID
+	}
+	fnSigs := make(map[ir.InstrID]fnSig)
+	for i, ins := range prog.Instrs {
+		if ins.Kind != ir.IRLet {
+			continue
+		}
+		var paramDefs []ir.InstrID
+		curr := ir.InstrID(ins.Arg0)
+		for curr != ir.NoInstr && int(curr) < len(prog.Instrs) && prog.Instrs[curr].Kind == ir.IRFn {
+			paramDefs = append(paramDefs, curr)
+			curr = ir.InstrID(prog.Instrs[curr].Arg0)
+		}
+		if len(paramDefs) > 0 && curr != ir.NoInstr && int(curr) < len(prog.Instrs) {
+			fnSigs[ir.InstrID(i)] = fnSig{
+				paramDefs: paramDefs,
+				bodyID:    curr,
+			}
+		}
+	}
+
+	setInstr := func(id ir.InstrID, k scalarKind) bool {
+		if id == ir.NoInstr || int(id) >= len(info.instr) || k == scalarUnknown {
+			return false
+		}
+		merged := joinScalar(info.instr[id], k)
+		if merged != info.instr[id] {
+			info.instr[id] = merged
+			return true
+		}
+		return false
+	}
+
+	setDef := func(id ir.InstrID, k scalarKind) bool {
+		if id == ir.NoInstr || k == scalarUnknown {
+			return false
+		}
+		merged := joinScalar(info.def[id], k)
+		if merged != info.def[id] {
+			info.def[id] = merged
+			return true
+		}
+		return false
+	}
+
+	for pass := 0; pass < 8; pass++ {
+		changed := false
+		for i, ins := range prog.Instrs {
+			id := ir.InstrID(i)
+			switch ins.Kind {
+			case ir.IRConst:
+				switch ins.SubOp {
+				case ir.ConstInt:
+					changed = setInstr(id, scalarInt) || changed
+				case ir.ConstFloat:
+					changed = setInstr(id, scalarFloat) || changed
+				case ir.ConstBool:
+					changed = setInstr(id, scalarBool) || changed
+				case ir.ConstString:
+					changed = setInstr(id, scalarString) || changed
+				}
+
+			case ir.IRAlloc, ir.IRFn:
+				changed = setInstr(id, scalarConflict) || changed
+
+			case ir.IRApp:
+				var revArgs []ir.InstrID
+				spine := id
+				for spine != ir.NoInstr && int(spine) < len(prog.Instrs) && prog.Instrs[spine].Kind == ir.IRApp {
+					revArgs = append(revArgs, ir.InstrID(prog.Instrs[spine].Arg1))
+					spine = ir.InstrID(prog.Instrs[spine].Arg0)
+				}
+				if defID, ok := info.varDef[spine]; ok {
+					if sig, okSig := fnSigs[defID]; okSig && len(revArgs) <= len(sig.paramDefs) {
+						for k := 0; k < len(revArgs); k++ {
+							argID := revArgs[len(revArgs)-1-k]
+							if int(argID) < len(info.instr) {
+								changed = setDef(sig.paramDefs[k], info.instr[argID]) || changed
+							}
+						}
+						if len(revArgs) == len(sig.paramDefs) && int(sig.bodyID) < len(info.instr) {
+							changed = setInstr(id, info.instr[sig.bodyID]) || changed
+						}
+					}
+				}
+
+			case ir.IRVar:
+				if defID, ok := info.varDef[id]; ok && defID != ir.NoInstr {
+					m := joinScalar(info.instr[id], info.def[defID])
+					changed = setInstr(id, m) || changed
+					changed = setDef(defID, m) || changed
+				}
+
+			case ir.IRLet:
+				arg0 := ir.InstrID(ins.Arg0)
+				if int(arg0) < len(info.instr) {
+					m := joinScalar(info.def[id], info.instr[arg0])
+					changed = setDef(id, m) || changed
+					changed = setInstr(arg0, m) || changed
+				}
+				if ir.InstrID(ins.Arg1) != ir.NoInstr && int(ins.Arg1) < len(info.instr) {
+					arg1 := ir.InstrID(ins.Arg1)
+					m := joinScalar(info.instr[id], info.instr[arg1])
+					changed = setInstr(id, m) || changed
+					changed = setInstr(arg1, m) || changed
+				} else if int(arg0) < len(info.instr) {
+					m := joinScalar(info.instr[id], info.instr[arg0])
+					changed = setInstr(id, m) || changed
+					changed = setInstr(arg0, m) || changed
+				}
+
+			case ir.IRStore:
+				if ins.SubOp != ir.StoreArrayElem {
+					if defID, ok := info.storeDef[id]; ok && defID != ir.NoInstr && int(ins.Arg1) < len(info.instr) {
+						arg1 := ir.InstrID(ins.Arg1)
+						m := joinScalar(info.def[defID], info.instr[arg1])
+						changed = setDef(defID, m) || changed
+						changed = setInstr(arg1, m) || changed
+					}
+				}
+
+			case ir.IRLoad:
+				if ins.SubOp == ir.LoadADTTag || ins.SubOp == ir.LoadListIsEmpty {
+					changed = setInstr(id, scalarInt) || changed
+				}
+
+			case ir.IRSwitch:
+				var branchKind scalarKind
+				count := uint32(ins.Data)
+				for j := uint32(0); j < count; j++ {
+					target := ir.InstrID(prog.Extra[ins.Arg1+j*2+1])
+					if isIgnorableSwitchBranch(prog, target) {
+						continue
+					}
+					branchKind = joinScalar(branchKind, info.instr[target])
+				}
+				aux := ir.InstrID(ins.Aux)
+				if !isIgnorableSwitchBranch(prog, aux) {
+					branchKind = joinScalar(branchKind, info.instr[aux])
+				}
+				merged := joinScalar(info.instr[id], branchKind)
+				if merged != scalarUnknown {
+					changed = setInstr(id, merged) || changed
+					for j := uint32(0); j < count; j++ {
+						target := ir.InstrID(prog.Extra[ins.Arg1+j*2+1])
+						if !isIgnorableSwitchBranch(prog, target) {
+							changed = setInstr(target, merged) || changed
+						}
+					}
+					if !isIgnorableSwitchBranch(prog, aux) {
+						changed = setInstr(aux, merged) || changed
+					}
+				}
+
+			case ir.IRPrim:
+				arg0 := ir.InstrID(ins.Arg0)
+				arg1 := ir.InstrID(ins.Arg1)
+				switch ins.SubOp {
+				case ir.PrimSeqBlock:
+					if ins.Arg1 > 0 {
+						last := ir.InstrID(prog.Extra[ins.Arg0+ins.Arg1-1])
+						if int(last) < len(info.instr) {
+							m := joinScalar(info.instr[id], info.instr[last])
+							changed = setInstr(id, m) || changed
+							changed = setInstr(last, m) || changed
+						}
+					}
+				case ir.PrimForTo:
+					changed = setDef(id, scalarInt) || changed
+				case ir.PrimMod:
+					changed = setInstr(id, scalarInt) || changed
+					changed = setInstr(arg0, scalarInt) || changed
+					changed = setInstr(arg1, scalarInt) || changed
+				case ir.PrimNot:
+					changed = setInstr(id, scalarBool) || changed
+					changed = setInstr(arg0, scalarBool) || changed
+				case ir.PrimAnd, ir.PrimOr:
+					changed = setInstr(id, scalarBool) || changed
+					changed = setInstr(arg0, scalarBool) || changed
+					changed = setInstr(arg1, scalarBool) || changed
+				case ir.PrimNeg:
+					if int(arg0) < len(info.instr) {
+						m := joinScalar(info.instr[id], info.instr[arg0])
+						if m == scalarInt || m == scalarFloat || m == scalarConflict {
+							changed = setInstr(id, m) || changed
+							changed = setInstr(arg0, m) || changed
+						}
+					}
+				case ir.PrimSub, ir.PrimMul, ir.PrimDiv:
+					if int(arg0) < len(info.instr) && int(arg1) < len(info.instr) {
+						m := joinScalar(info.instr[id], joinScalar(info.instr[arg0], info.instr[arg1]))
+						if m == scalarInt || m == scalarFloat || m == scalarConflict {
+							changed = setInstr(id, m) || changed
+							changed = setInstr(arg0, m) || changed
+							changed = setInstr(arg1, m) || changed
+						}
+					}
+				case ir.PrimAdd:
+					if int(arg0) < len(info.instr) && int(arg1) < len(info.instr) {
+						m := joinScalar(info.instr[id], joinScalar(info.instr[arg0], info.instr[arg1]))
+						if m == scalarInt || m == scalarFloat || m == scalarString || m == scalarConflict {
+							changed = setInstr(id, m) || changed
+							changed = setInstr(arg0, m) || changed
+							changed = setInstr(arg1, m) || changed
+						}
+					}
+				case ir.PrimLt, ir.PrimLe, ir.PrimGt, ir.PrimGe, ir.PrimEq, ir.PrimNeq:
+					changed = setInstr(id, scalarBool) || changed
+					if int(arg0) < len(info.instr) && int(arg1) < len(info.instr) {
+						opKind := joinScalar(info.instr[arg0], info.instr[arg1])
+						if opKind != scalarUnknown {
+							changed = setInstr(arg0, opKind) || changed
+							changed = setInstr(arg1, opKind) || changed
+						}
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return info
+}
+
+func isIgnorableSwitchBranch(prog *ir.Program, id ir.InstrID) bool {
+	if id == ir.NoInstr || int(id) >= len(prog.Instrs) {
+		return true
+	}
+	ins := prog.Instrs[id]
+	if ins.Kind == ir.IRConst && ins.SubOp == ir.ConstUnit {
+		return true
+	}
+	if ins.Kind == ir.IRPrim && ins.SubOp == ir.PrimRaise {
+		return true
+	}
+	return false
+}
+
+func cloneLexScope(src map[token.StringID]ir.InstrID) map[token.StringID]ir.InstrID {
+	dst := make(map[token.StringID]ir.InstrID, len(src)+4)
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func resolveLexicalDefs(prog *ir.Program, id ir.InstrID, scope map[token.StringID]ir.InstrID, info *aotScalarInfo, visited map[ir.InstrID]bool) {
+	if id == ir.NoInstr || int(id) >= len(prog.Instrs) || visited[id] {
+		return
+	}
+	visited[id] = true
+	ins := prog.Instrs[id]
+
+	switch ins.Kind {
+	case ir.IRConst:
+		return
+	case ir.IRVar:
+		sym := token.StringID(ins.Data)
+		if defID, ok := scope[sym]; ok {
+			info.varDef[id] = defID
+		}
+	case ir.IRLet:
+		sym := token.StringID(ins.Data)
+		rhsScope := scope
+		if ins.Flags&ir.IRFlagRec != 0 && sym != token.NoString {
+			rhsScope = cloneLexScope(scope)
+			rhsScope[sym] = id
+		}
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), rhsScope, info, visited)
+		if ir.InstrID(ins.Arg1) != ir.NoInstr {
+			bodyScope := cloneLexScope(scope)
+			if sym != token.NoString {
+				bodyScope[sym] = id
+			}
+			resolveLexicalDefs(prog, ir.InstrID(ins.Arg1), bodyScope, info, visited)
+		}
+	case ir.IRFn:
+		bodyScope := cloneLexScope(scope)
+		if param := token.StringID(ins.Data); param != token.NoString {
+			bodyScope[param] = id
+		}
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), bodyScope, info, visited)
+	case ir.IRApp:
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg1), scope, info, visited)
+	case ir.IRSwitch:
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+		count := uint32(ins.Data)
+		for i := uint32(0); i < count; i++ {
+			target := ir.InstrID(prog.Extra[ins.Arg1+i*2+1])
+			resolveLexicalDefs(prog, target, scope, info, visited)
+		}
+		resolveLexicalDefs(prog, ir.InstrID(ins.Aux), scope, info, visited)
+	case ir.IRPrim:
+		if ins.SubOp == ir.PrimSeqBlock {
+			blockScope := cloneLexScope(scope)
+			for i := uint32(0); i < ins.Arg1; i++ {
+				ch := ir.InstrID(prog.Extra[ins.Arg0+i])
+				if int(ch) < len(prog.Instrs) {
+					chIns := prog.Instrs[ch]
+					if chIns.Kind == ir.IRLet && chIns.Flags&ir.IRFlagRec != 0 && chIns.Data != 0 {
+						blockScope[token.StringID(chIns.Data)] = ch
+					}
+				}
+			}
+			for i := uint32(0); i < ins.Arg1; i++ {
+				ch := ir.InstrID(prog.Extra[ins.Arg0+i])
+				resolveLexicalDefs(prog, ch, blockScope, info, visited)
+				if int(ch) < len(prog.Instrs) {
+					chIns := prog.Instrs[ch]
+					if chIns.Kind == ir.IRLet && ir.InstrID(chIns.Arg1) == ir.NoInstr && chIns.Data != 0 {
+						blockScope[token.StringID(chIns.Data)] = ch
+					}
+				}
+			}
+			return
+		}
+		if ins.SubOp == ir.PrimForIn || ins.SubOp == ir.PrimForTo {
+			resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+			loopScope := cloneLexScope(scope)
+			if sym := token.StringID(ins.Data); sym != token.NoString {
+				loopScope[sym] = id
+			}
+			resolveLexicalDefs(prog, ir.InstrID(ins.Arg1), loopScope, info, visited)
+			return
+		}
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg1), scope, info, visited)
+	case ir.IRAlloc:
+		if ins.SubOp == ir.AllocADT {
+			resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+			return
+		}
+		if ins.SubOp == ir.AllocRecord {
+			if ins.Flags != 0 {
+				resolveLexicalDefs(prog, ir.InstrID(ins.Aux), scope, info, visited)
+			}
+			for i := uint32(0); i < ins.Arg1; i += 2 {
+				valID := ir.InstrID(prog.Extra[ins.Arg0+i+1])
+				resolveLexicalDefs(prog, valID, scope, info, visited)
+			}
+			return
+		}
+		for i := uint32(0); i < ins.Arg1; i++ {
+			ch := ir.InstrID(prog.Extra[ins.Arg0+i])
+			resolveLexicalDefs(prog, ch, scope, info, visited)
+		}
+	case ir.IRLoad:
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+	case ir.IRStore:
+		if ins.SubOp != ir.StoreArrayElem {
+			if defID, ok := scope[token.StringID(ins.Data)]; ok {
+				info.storeDef[id] = defID
+			}
+		}
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg0), scope, info, visited)
+		resolveLexicalDefs(prog, ir.InstrID(ins.Arg1), scope, info, visited)
+		resolveLexicalDefs(prog, ir.InstrID(ins.Aux), scope, info, visited)
+	}
+}
+
+func unboxedIntExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (string, bool) {
+	if scalars == nil || id == ir.NoInstr || int(id) >= len(prog.Instrs) || scalars.instr[id] != scalarInt {
+		return "", false
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case ir.IRConst:
+		if ins.SubOp == ir.ConstInt {
+			return fmt.Sprintf("int64(%d)", int64(ins.Data)), true
+		}
+	case ir.IRVar:
+		if defID, ok := scalars.varDef[id]; ok && defID != ir.NoInstr && scalars.def[defID] == scalarInt {
+			return fmt.Sprintf("aotLoadInt(vm, env, token.StringID(%d))", ins.Data), true
+		}
+	case ir.IRPrim:
+		switch ins.SubOp {
+		case ir.PrimNeg:
+			if op, ok := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+				return fmt.Sprintf("(-%s)", op), true
+			}
+		case ir.PrimAdd, ir.PrimSub, ir.PrimMul:
+			lhs, okL := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars)
+			rhs, okR := unboxedIntExpr(prog, ir.InstrID(ins.Arg1), scalars)
+			if okL && okR {
+				op := "+"
+				if ins.SubOp == ir.PrimSub {
+					op = "-"
+				} else if ins.SubOp == ir.PrimMul {
+					op = "*"
+				}
+				return fmt.Sprintf("(%s %s %s)", lhs, op, rhs), true
+			}
+		case ir.PrimDiv, ir.PrimMod:
+			if int(ins.Arg1) < len(prog.Instrs) {
+				rIns := prog.Instrs[ins.Arg1]
+				if rIns.Kind == ir.IRConst && rIns.SubOp == ir.ConstInt && int64(rIns.Data) != 0 {
+					if lhs, okL := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+						op := "/"
+						if ins.SubOp == ir.PrimMod {
+							op = "%"
+						}
+						return fmt.Sprintf("(%s %s int64(%d))", lhs, op, int64(rIns.Data)), true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func unboxedFloatExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (string, bool) {
+	if scalars == nil || id == ir.NoInstr || int(id) >= len(prog.Instrs) || scalars.instr[id] != scalarFloat {
+		return "", false
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case ir.IRConst:
+		if ins.SubOp == ir.ConstFloat {
+			f := math.Float64frombits(ins.Data)
+			if !math.IsNaN(f) && !math.IsInf(f, 0) {
+				return fmt.Sprintf("float64(%s)", strconv.FormatFloat(f, 'g', -1, 64)), true
+			}
+		}
+	case ir.IRVar:
+		if defID, ok := scalars.varDef[id]; ok && defID != ir.NoInstr && scalars.def[defID] == scalarFloat {
+			return fmt.Sprintf("aotLoadFloat(vm, env, token.StringID(%d))", ins.Data), true
+		}
+	case ir.IRPrim:
+		switch ins.SubOp {
+		case ir.PrimNeg:
+			if op, ok := unboxedFloatExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+				return fmt.Sprintf("(-%s)", op), true
+			}
+		case ir.PrimAdd, ir.PrimSub, ir.PrimMul:
+			lhs, okL := unboxedFloatExpr(prog, ir.InstrID(ins.Arg0), scalars)
+			rhs, okR := unboxedFloatExpr(prog, ir.InstrID(ins.Arg1), scalars)
+			if okL && okR {
+				op := "+"
+				if ins.SubOp == ir.PrimSub {
+					op = "-"
+				} else if ins.SubOp == ir.PrimMul {
+					op = "*"
+				}
+				return fmt.Sprintf("(%s %s %s)", lhs, op, rhs), true
+			}
+		case ir.PrimDiv:
+			if int(ins.Arg1) < len(prog.Instrs) {
+				rIns := prog.Instrs[ins.Arg1]
+				if rIns.Kind == ir.IRConst && rIns.SubOp == ir.ConstFloat {
+					rf := math.Float64frombits(rIns.Data)
+					if rf != 0 && !math.IsNaN(rf) && !math.IsInf(rf, 0) {
+						if lhs, okL := unboxedFloatExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+							return fmt.Sprintf("(%s / float64(%s))", lhs, strconv.FormatFloat(rf, 'g', -1, 64)), true
+						}
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func unboxedBoolExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (string, bool) {
+	if scalars == nil || id == ir.NoInstr || int(id) >= len(prog.Instrs) || scalars.instr[id] != scalarBool {
+		return "", false
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case ir.IRConst:
+		if ins.SubOp == ir.ConstBool {
+			return fmt.Sprintf("%v", ins.Data != 0), true
+		}
+	case ir.IRVar:
+		if defID, ok := scalars.varDef[id]; ok && defID != ir.NoInstr && scalars.def[defID] == scalarBool {
+			return fmt.Sprintf("aotLoadBool(vm, env, token.StringID(%d))", ins.Data), true
+		}
+	case ir.IRPrim:
+		switch ins.SubOp {
+		case ir.PrimNot:
+			if op, ok := unboxedBoolExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+				return fmt.Sprintf("(!%s)", op), true
+			}
+		case ir.PrimAnd, ir.PrimOr:
+			lhs, okL := unboxedBoolExpr(prog, ir.InstrID(ins.Arg0), scalars)
+			rhs, okR := unboxedBoolExpr(prog, ir.InstrID(ins.Arg1), scalars)
+			if okL && okR {
+				op := "&&"
+				if ins.SubOp == ir.PrimOr {
+					op = "||"
+				}
+				return fmt.Sprintf("(%s %s %s)", lhs, op, rhs), true
+			}
+		case ir.PrimEq, ir.PrimNeq, ir.PrimLt, ir.PrimLe, ir.PrimGt, ir.PrimGe:
+			cmpOp := primCmpOpString(ins.SubOp)
+			if lhs, okL := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+				if rhs, okR := unboxedIntExpr(prog, ir.InstrID(ins.Arg1), scalars); okR {
+					return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
+				}
+			}
+			if lhs, okL := unboxedFloatExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+				if rhs, okR := unboxedFloatExpr(prog, ir.InstrID(ins.Arg1), scalars); okR {
+					return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
+				}
+			}
+			if ins.SubOp == ir.PrimEq || ins.SubOp == ir.PrimNeq {
+				if lhs, okL := unboxedBoolExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+					if rhs, okR := unboxedBoolExpr(prog, ir.InstrID(ins.Arg1), scalars); okR {
+						return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func primCmpOpString(subOp uint16) string {
+	switch subOp {
+	case ir.PrimEq:
+		return "=="
+	case ir.PrimNeq:
+		return "!="
+	case ir.PrimLt:
+		return "<"
+	case ir.PrimLe:
+		return "<="
+	case ir.PrimGt:
+		return ">"
+	case ir.PrimGe:
+		return ">="
+	default:
+		return "=="
+	}
+}
+
+func unboxedValueExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (string, bool) {
+	if iExpr, ok := unboxedIntExpr(prog, id, scalars); ok {
+		return fmt.Sprintf("runtime.IntVal{V: %s}", iExpr), true
+	}
+	if fExpr, ok := unboxedFloatExpr(prog, id, scalars); ok {
+		return fmt.Sprintf("runtime.FloatVal{V: %s}", fExpr), true
+	}
+	if bExpr, ok := unboxedBoolExpr(prog, id, scalars); ok {
+		return fmt.Sprintf("runtime.BoolVal{V: %s}", bExpr), true
+	}
+	return "", false
+}
+
+func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir.IRInstr, selfTailCalls map[ir.InstrID]*selfTailCallInfo, scalars *aotScalarInfo) {
 	fmt.Fprintf(buf, "\t\tcase %d:\n", id)
 	switch ins.Kind {
 	case ir.IRConst:
@@ -475,6 +1122,23 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 
 	case ir.IRLet:
 		sym := token.StringID(ins.Data)
+		if ins.Flags&ir.IRFlagRec == 0 {
+			if uVal, ok := unboxedValueExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+				fmt.Fprintf(buf, "\t\t\tval := runtime.Value(%s)\n", uVal)
+				if ins.Flags&ir.IRFlagMutable != 0 {
+					buf.WriteString("\t\t\tval = &runtime.RefCell{Val: val}\n")
+				}
+				if sym != token.NoString {
+					fmt.Fprintf(buf, "\t\t\tenv[token.StringID(%d)] = val\n", sym)
+				}
+				if ir.InstrID(ins.Arg1) != ir.NoInstr {
+					fmt.Fprintf(buf, "\t\t\tid = %d\n\t\t\tcontinue tcoLoop\n", ins.Arg1)
+				} else {
+					buf.WriteString("\t\t\treturn runtime.Deref(val), nil\n")
+				}
+				return
+			}
+		}
 		fmt.Fprintf(buf, "\t\t\tval, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 		buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		if ins.Flags&ir.IRFlagRec != 0 {
@@ -532,6 +1196,27 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 		if tc, ok := selfTailCalls[id]; ok {
 			buf.WriteString("\t\t\t// Direct self-recursive tail-call loop lowering\n")
 			for i, argID := range tc.argIDs {
+				if uVal, ok := unboxedValueExpr(prog, argID, scalars); ok {
+					fmt.Fprintf(buf, "\t\t\targVal_%d := runtime.Value(%s)\n", i, uVal)
+					continue
+				}
+				if int(argID) < len(prog.Instrs) {
+					aIns := prog.Instrs[argID]
+					if aIns.Kind == ir.IRPrim && (aIns.SubOp == ir.PrimDiv || aIns.SubOp == ir.PrimMod) {
+						if lhs, okL := unboxedIntExpr(prog, ir.InstrID(aIns.Arg0), scalars); okL {
+							if rhs, okR := unboxedIntExpr(prog, ir.InstrID(aIns.Arg1), scalars); okR {
+								op := "/"
+								if aIns.SubOp == ir.PrimMod {
+									op = "%"
+								}
+								fmt.Fprintf(buf, "\t\t\trhsInt_%d := %s\n", i, rhs)
+								fmt.Fprintf(buf, "\t\t\tif rhsInt_%d == 0 {\n\t\t\t\treturn nil, fmt.Errorf(\"division by zero\")\n\t\t\t}\n", i)
+								fmt.Fprintf(buf, "\t\t\targVal_%d := runtime.Value(runtime.IntVal{V: (%s %s rhsInt_%d)})\n", i, lhs, op, i)
+								continue
+							}
+						}
+					}
+				}
 				fmt.Fprintf(buf, "\t\t\targVal_%d, err := evalAOT(vm, %d, env)\n", i, argID)
 				buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 			}
@@ -574,11 +1259,45 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 		buf.WriteString("\t\t\treturn vm.Apply(fnVal, argVal)\n")
 
 	case ir.IRSwitch:
+		count := uint32(ins.Data)
+		if count == 1 && int(ins.Arg1+1) < len(prog.Extra) {
+			caseTag := prog.Extra[ins.Arg1]
+			target := ir.InstrID(prog.Extra[ins.Arg1+1])
+			if (caseTag == 0 || caseTag == 1) {
+				if condExpr, ok := unboxedBoolExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+					buf.WriteString("\t\t\t// Unboxed boolean branch specialization\n")
+					if caseTag == 1 {
+						fmt.Fprintf(buf, "\t\t\tif %s {\n\t\t\t\tid = %d\n\t\t\t\tcontinue tcoLoop\n\t\t\t}\n", condExpr, target)
+						fmt.Fprintf(buf, "\t\t\tid = %d\n\t\t\tcontinue tcoLoop\n", ir.InstrID(ins.Aux))
+					} else {
+						fmt.Fprintf(buf, "\t\t\tif !(%s) {\n\t\t\t\tid = %d\n\t\t\t\tcontinue tcoLoop\n\t\t\t}\n", condExpr, target)
+						fmt.Fprintf(buf, "\t\t\tid = %d\n\t\t\tcontinue tcoLoop\n", ir.InstrID(ins.Aux))
+					}
+					return
+				}
+			}
+		}
+		if intExpr, ok := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+			buf.WriteString("\t\t\t// Unboxed int64 switch specialization\n")
+			fmt.Fprintf(buf, "\t\t\tswitch uint32(%s) {\n", intExpr)
+			seenTags := make(map[uint32]bool, count)
+			for i := uint32(0); i < count; i++ {
+				caseTag := prog.Extra[ins.Arg1+i*2]
+				target := ir.InstrID(prog.Extra[ins.Arg1+i*2+1])
+				if seenTags[caseTag] {
+					continue
+				}
+				seenTags[caseTag] = true
+				fmt.Fprintf(buf, "\t\t\tcase %d:\n\t\t\t\tid = %d\n\t\t\t\tcontinue tcoLoop\n", caseTag, target)
+			}
+			fmt.Fprintf(buf, "\t\t\tdefault:\n\t\t\t\tid = %d\n\t\t\t\tcontinue tcoLoop\n", ir.InstrID(ins.Aux))
+			buf.WriteString("\t\t\t}\n")
+			return
+		}
 		fmt.Fprintf(buf, "\t\t\tscrutVal, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 		buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		buf.WriteString("\t\t\tscrutTag := runtime.ExtractSwitchTag(runtime.Deref(scrutVal), vm.Prog.Strings)\n")
 		buf.WriteString("\t\t\tswitch scrutTag {\n")
-		count := uint32(ins.Data)
 		seenTags := make(map[uint32]bool, count)
 		for i := uint32(0); i < count; i++ {
 			caseTag := prog.Extra[ins.Arg1+i*2]
@@ -593,7 +1312,7 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 		buf.WriteString("\t\t\t}\n")
 
 	case ir.IRPrim:
-		emitCompiledPrim(buf, prog, ins)
+		emitCompiledPrim(buf, prog, id, ins, scalars)
 
 	case ir.IRAlloc:
 		emitCompiledAlloc(buf, prog, ins)
@@ -602,9 +1321,13 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 		emitCompiledLoad(buf, prog, ins)
 
 	case ir.IRStore:
-		fmt.Fprintf(buf, "\t\t\tval, err := evalAOT(vm, %d, env)\n", ins.Arg1)
-		buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		buf.WriteString("\t\t\tval = runtime.Deref(val)\n")
+		if uVal, ok := unboxedValueExpr(prog, ir.InstrID(ins.Arg1), scalars); ok {
+			fmt.Fprintf(buf, "\t\t\tval := runtime.Value(%s)\n", uVal)
+		} else {
+			fmt.Fprintf(buf, "\t\t\tval, err := evalAOT(vm, %d, env)\n", ins.Arg1)
+			buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
+			buf.WriteString("\t\t\tval = runtime.Deref(val)\n")
+		}
 		if ins.SubOp == ir.StoreArrayElem {
 			fmt.Fprintf(buf, "\t\t\tarrVal, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 			buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
@@ -632,7 +1355,7 @@ func emitCompiledCase(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 	}
 }
 
-func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, ins ir.IRInstr) {
+func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir.IRInstr, scalars *aotScalarInfo) {
 	switch ins.SubOp {
 	case ir.PrimSeqBlock:
 		if ins.Arg1 == 0 {
@@ -648,6 +1371,14 @@ func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, ins ir.IRInstr) {
 		return
 
 	case ir.PrimWhile:
+		if condExpr, ok := unboxedBoolExpr(prog, ir.InstrID(ins.Arg0), scalars); ok {
+			buf.WriteString("\t\t\t// Unboxed while-loop condition specialization\n")
+			fmt.Fprintf(buf, "\t\t\tfor %s {\n", condExpr)
+			fmt.Fprintf(buf, "\t\t\t\tif _, err := evalAOT(vm, %d, env); err != nil {\n\t\t\t\t\treturn nil, err\n\t\t\t\t}\n", ins.Arg1)
+			buf.WriteString("\t\t\t}\n")
+			buf.WriteString("\t\t\treturn runtime.Unit, nil\n")
+			return
+		}
 		buf.WriteString("\t\t\tfor {\n")
 		fmt.Fprintf(buf, "\t\t\t\tcVal, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 		buf.WriteString("\t\t\t\tif err != nil {\n\t\t\t\t\treturn nil, err\n\t\t\t\t}\n")
@@ -703,6 +1434,16 @@ func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, ins ir.IRInstr) {
 		return
 
 	case ir.PrimNeg:
+		if iExpr, ok := unboxedIntExpr(prog, id, scalars); ok {
+			buf.WriteString("\t\t\t// Unboxed int64 specialization\n")
+			fmt.Fprintf(buf, "\t\t\treturn runtime.IntVal{V: %s}, nil\n", iExpr)
+			return
+		}
+		if fExpr, ok := unboxedFloatExpr(prog, id, scalars); ok {
+			buf.WriteString("\t\t\t// Unboxed float64 specialization\n")
+			fmt.Fprintf(buf, "\t\t\treturn runtime.FloatVal{V: %s}, nil\n", fExpr)
+			return
+		}
 		fmt.Fprintf(buf, "\t\t\tv, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 		buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		buf.WriteString("\t\t\tswitch nv := runtime.Deref(v).(type) {\n")
@@ -712,6 +1453,11 @@ func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, ins ir.IRInstr) {
 		return
 
 	case ir.PrimNot:
+		if bExpr, ok := unboxedBoolExpr(prog, id, scalars); ok {
+			buf.WriteString("\t\t\t// Unboxed bool specialization\n")
+			fmt.Fprintf(buf, "\t\t\treturn runtime.BoolVal{V: %s}, nil\n", bExpr)
+			return
+		}
 		fmt.Fprintf(buf, "\t\t\tv, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 		buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 		buf.WriteString("\t\t\tbv, ok := runtime.Deref(v).(runtime.BoolVal)\n")
@@ -720,7 +1466,50 @@ func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, ins ir.IRInstr) {
 		return
 	}
 
-	// Binary primitives
+	// Unboxed scalar specialization for binary arithmetic, comparison, and boolean logic
+	if iExpr, ok := unboxedIntExpr(prog, id, scalars); ok {
+		buf.WriteString("\t\t\t// Unboxed int64 specialization\n")
+		fmt.Fprintf(buf, "\t\t\treturn runtime.IntVal{V: %s}, nil\n", iExpr)
+		return
+	}
+	if fExpr, ok := unboxedFloatExpr(prog, id, scalars); ok {
+		buf.WriteString("\t\t\t// Unboxed float64 specialization\n")
+		fmt.Fprintf(buf, "\t\t\treturn runtime.FloatVal{V: %s}, nil\n", fExpr)
+		return
+	}
+	if bExpr, ok := unboxedBoolExpr(prog, id, scalars); ok {
+		buf.WriteString("\t\t\t// Unboxed bool specialization\n")
+		fmt.Fprintf(buf, "\t\t\treturn runtime.BoolVal{V: %s}, nil\n", bExpr)
+		return
+	}
+	if ins.SubOp == ir.PrimDiv || ins.SubOp == ir.PrimMod {
+		if lhs, okL := unboxedIntExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+			if rhs, okR := unboxedIntExpr(prog, ir.InstrID(ins.Arg1), scalars); okR {
+				op := "/"
+				if ins.SubOp == ir.PrimMod {
+					op = "%"
+				}
+				buf.WriteString("\t\t\t// Unboxed int64 division/modulo specialization\n")
+				fmt.Fprintf(buf, "\t\t\trhsInt := %s\n", rhs)
+				buf.WriteString("\t\t\tif rhsInt == 0 {\n\t\t\t\treturn nil, fmt.Errorf(\"division by zero\")\n\t\t\t}\n")
+				fmt.Fprintf(buf, "\t\t\treturn runtime.IntVal{V: (%s %s rhsInt)}, nil\n", lhs, op)
+				return
+			}
+		}
+		if ins.SubOp == ir.PrimDiv {
+			if lhs, okL := unboxedFloatExpr(prog, ir.InstrID(ins.Arg0), scalars); okL {
+				if rhs, okR := unboxedFloatExpr(prog, ir.InstrID(ins.Arg1), scalars); okR {
+					buf.WriteString("\t\t\t// Unboxed float64 division specialization\n")
+					fmt.Fprintf(buf, "\t\t\trhsFloat := %s\n", rhs)
+					buf.WriteString("\t\t\tif rhsFloat == 0 {\n\t\t\t\treturn nil, fmt.Errorf(\"float division by zero\")\n\t\t\t}\n")
+					fmt.Fprintf(buf, "\t\t\treturn runtime.FloatVal{V: (%s / rhsFloat)}, nil\n", lhs)
+					return
+				}
+			}
+		}
+	}
+
+	// Binary primitives fallback
 	fmt.Fprintf(buf, "\t\t\tlhs, err := evalAOT(vm, %d, env)\n", ins.Arg0)
 	buf.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 	fmt.Fprintf(buf, "\t\t\trhs, err := evalAOT(vm, %d, env)\n", ins.Arg1)

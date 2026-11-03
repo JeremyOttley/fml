@@ -232,3 +232,79 @@ s + g
 	}
 }
 
+func TestAOTUnboxedScalarTypeSpecialization(t *testing.T) {
+	src := `
+[<Measure>] type kg
+[<Measure>] type m
+[<Measure>] type s
+
+let kineticEnergy (mass: float<kg>) (vel: float<m/s>) =
+    0.5 * mass * (vel * vel)
+
+let avgForce (energy: float<kg*m^2/s^2>) (dist: float<m>) =
+    energy / dist
+
+let rec fibIter (n: int) (a: int) (b: int) =
+    if n <= 0 then a
+    else fibIter (n - 1) b (a + b)
+
+let mutable countdown = 5
+let mutable accum = 0
+while countdown > 0 do
+    accum <- accum + (countdown * 2)
+    countdown <- countdown - 1
+
+let ke = kineticEnergy 4.0<kg> 10.0<m/s>
+let f = avgForce ke 8.0<m>
+let fib10 = fibIter 10 0 1
+printfn f
+printfn (fib10 + accum)
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "scalar_spec.fml")
+	binPath := filepath.Join(tmpDir, "scalar_spec_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	requiredMarkers := []string{
+		"Unboxed int64 specialization",
+		"Unboxed float64 specialization",
+		"Unboxed float64 division specialization",
+		"Unboxed boolean branch specialization",
+		"Unboxed while-loop condition specialization",
+		"aotLoadInt(vm, env,",
+		"aotLoadFloat(vm, env,",
+	}
+	for _, marker := range requiredMarkers {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	// ke = 0.5 * 4 * 100 = 200.0; f = 200.0 / 8.0 = 25
+	// fib10 = 55; accum = 10 + 8 + 6 + 4 + 2 = 30 -> 55 + 30 = 85
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 || strings.TrimSpace(lines[0]) != "25" || strings.TrimSpace(lines[1]) != "85" {
+		t.Fatalf("expected output lines ['25', '85'], got %v", lines)
+	}
+}
+
+
