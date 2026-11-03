@@ -1,0 +1,9 @@
+# Compiled binaries
+/fml
+*.exe
+*.out
+*.test
+
+# Coverage and profiling
+*.cov
+*.prof

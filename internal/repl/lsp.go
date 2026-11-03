@@ -1,0 +1,759 @@
+package repl
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"fml/internal/ast"
+	"fml/internal/parser"
+	"fml/internal/token"
+	"fml/internal/types"
+)
+
+// LSPServer implements a zero-dependency Language Server Protocol (JSON-RPC 2.0)
+// endpoint for FML supporting real-time diagnostics (`textDocument/publishDiagnostics`)
+// and type hover (`textDocument/hover`).
+//
+// Jaime says: An LSP server shouldn't pull in fifty megabytes of framework
+// dependencies. Read the Content-Length header, unmarshal the JSON-RPC envelope,
+// run the flat Arena parser and Union-Find type checker on the buffer, and map
+// the cursor's (Line, Col) directly against our 16-byte Token array.
+type LSPServer struct {
+	Docs map[string]string
+	Out  io.Writer
+}
+
+type rpcMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  any             `json:"result,omitempty"`
+	Error   any             `json:"error,omitempty"`
+}
+
+type lspPosition struct {
+	Line      int `json:"line"`
+	Character int `json:"character"`
+}
+
+type lspRange struct {
+	Start lspPosition `json:"start"`
+	End   lspPosition `json:"end"`
+}
+
+type lspDiagnostic struct {
+	Range    lspRange `json:"range"`
+	Severity int      `json:"severity"`
+	Source   string   `json:"source"`
+	Message  string   `json:"message"`
+}
+
+type lspLocation struct {
+	URI   string   `json:"uri"`
+	Range lspRange `json:"range"`
+}
+
+type lspDocumentSymbol struct {
+	Name           string    `json:"name"`
+	Detail         string    `json:"detail,omitempty"`
+	Kind           int       `json:"kind"`
+	Range          lspRange  `json:"range"`
+	SelectionRange lspRange  `json:"selectionRange"`
+}
+
+type lspCompletionItem struct {
+	Label  string `json:"label"`
+	Kind   int    `json:"kind"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// NewLSPServer initializes an in-memory LSP server writing responses to out.
+func NewLSPServer(out io.Writer) *LSPServer {
+	return &LSPServer{
+		Docs: make(map[string]string),
+		Out:  out,
+	}
+}
+
+// RunLSP runs the Language Server Protocol JSON-RPC loop over in and out.
+func RunLSP(in io.Reader, out io.Writer) error {
+	srv := NewLSPServer(out)
+	reader := bufio.NewReader(in)
+
+	for {
+		payload, err := readLSPPayload(reader)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if exit := srv.HandleJSONRPC(payload); exit {
+			return nil
+		}
+	}
+}
+
+func readLSPPayload(r *bufio.Reader) ([]byte, error) {
+	contentLen := -1
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if err == io.EOF && len(strings.TrimSpace(line)) > 0 {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "{") {
+					return []byte(trimmed), nil
+				}
+			}
+			return nil, err
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			if contentLen >= 0 {
+				break
+			}
+			continue
+		}
+		// Support raw line-delimited JSON-RPC in addition to Content-Length headers
+		if contentLen < 0 && strings.HasPrefix(trimmed, "{") {
+			return []byte(trimmed), nil
+		}
+		if strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
+			valStr := strings.TrimSpace(trimmed[len("content-length:"):])
+			if n, err := strconv.Atoi(valStr); err == nil {
+				contentLen = n
+			}
+		}
+	}
+	buf := make([]byte, contentLen)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// HandleJSONRPC processes a single JSON-RPC 2.0 request/notification payload
+// and returns true if the server received an `exit` notification.
+func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
+	var msg rpcMessage
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return false
+	}
+
+	switch msg.Method {
+	case "initialize":
+		s.sendResponse(msg.ID, map[string]any{
+			"capabilities": map[string]any{
+				"textDocumentSync":       1,
+				"hoverProvider":          true,
+				"definitionProvider":     true,
+				"documentSymbolProvider": true,
+				"referencesProvider":     true,
+				"completionProvider": map[string]any{
+					"triggerCharacters": []string{"."},
+				},
+			},
+			"serverInfo": map[string]any{
+				"name":    "fml-lsp",
+				"version": "1.0.0",
+			},
+		})
+
+	case "initialized":
+		// No response required for notification
+
+	case "textDocument/didOpen":
+		var params struct {
+			TextDocument struct {
+				URI  string `json:"uri"`
+				Text string `json:"text"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			s.Docs[params.TextDocument.URI] = params.TextDocument.Text
+			s.analyzeAndPublishDiagnostics(params.TextDocument.URI, params.TextDocument.Text)
+		}
+
+	case "textDocument/didChange":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			ContentChanges []struct {
+				Text string `json:"text"`
+			} `json:"contentChanges"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil && len(params.ContentChanges) > 0 {
+			latest := params.ContentChanges[len(params.ContentChanges)-1].Text
+			s.Docs[params.TextDocument.URI] = latest
+			s.analyzeAndPublishDiagnostics(params.TextDocument.URI, latest)
+		}
+
+	case "textDocument/hover":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			hoverMD := s.computeHover(params.TextDocument.URI, params.Position)
+			if hoverMD == "" {
+				s.sendResponse(msg.ID, nil)
+			} else {
+				s.sendResponse(msg.ID, map[string]any{
+					"contents": map[string]any{
+						"kind":  "markdown",
+						"value": hoverMD,
+					},
+				})
+			}
+		}
+
+	case "textDocument/definition":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			loc := s.computeDefinition(params.TextDocument.URI, params.Position)
+			if loc == nil {
+				s.sendResponse(msg.ID, nil)
+			} else {
+				s.sendResponse(msg.ID, loc)
+			}
+		}
+
+	case "textDocument/documentSymbol":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			syms := s.computeDocumentSymbols(params.TextDocument.URI)
+			s.sendResponse(msg.ID, syms)
+		}
+
+	case "textDocument/completion":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			items := s.computeCompletion(params.TextDocument.URI, params.Position)
+			s.sendResponse(msg.ID, items)
+		}
+
+	case "textDocument/references":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			locs := s.computeReferences(params.TextDocument.URI, params.Position)
+			s.sendResponse(msg.ID, locs)
+		}
+
+	case "shutdown":
+		s.sendResponse(msg.ID, nil)
+
+	case "exit":
+		return true
+	}
+	return false
+}
+
+var diagLineColRe = regexp.MustCompile(`line (\d+), col (\d+)`)
+
+func (s *LSPServer) analyzeAndPublishDiagnostics(uri, text string) {
+	diags := make([]lspDiagnostic, 0)
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err == nil {
+		chk := types.NewChecker(p.Arena, nil)
+		chk.AttachSource(p.Source(), p.Tokens())
+		_, err = chk.Infer(root)
+	}
+	if err != nil {
+		lineIdx, colIdx := 0, 0
+		if m := diagLineColRe.FindStringSubmatch(err.Error()); len(m) == 3 {
+			if l, e1 := strconv.Atoi(m[1]); e1 == nil && l > 0 {
+				lineIdx = l - 1
+			}
+			if c, e2 := strconv.Atoi(m[2]); e2 == nil && c > 0 {
+				colIdx = c - 1
+			}
+		}
+		diags = append(diags, lspDiagnostic{
+			Range: lspRange{
+				Start: lspPosition{Line: lineIdx, Character: colIdx},
+				End:   lspPosition{Line: lineIdx, Character: colIdx + 1},
+			},
+			Severity: 1,
+			Source:   "fml",
+			Message:  err.Error(),
+		})
+	}
+	s.sendNotification("textDocument/publishDiagnostics", map[string]any{
+		"uri":         uri,
+		"diagnostics": diags,
+	})
+}
+
+func (s *LSPServer) computeHover(uri string, pos lspPosition) string {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return ""
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return ""
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	if _, err := chk.Infer(root); err != nil {
+		return ""
+	}
+
+	targetLine := uint16(pos.Line + 1)
+	targetCol := uint16(pos.Character + 1)
+
+	// Find the token under (targetLine, targetCol)
+	tokIdx := -1
+	var symName string
+	for i, tk := range p.Tokens() {
+		if tk.Line == targetLine {
+			spanLen := uint16(tk.End - tk.Start)
+			if spanLen == 0 {
+				spanLen = 1
+			}
+			if targetCol >= tk.Col && targetCol <= tk.Col+spanLen {
+				tokIdx = i
+				symName = string(tk.Slice(p.Source()))
+				break
+			}
+		}
+	}
+
+	// 1. Check if an AST node directly references tokIdx and has an inferred type
+	if tokIdx >= 0 {
+		for id := 1; id < len(p.Arena.Nodes); id++ {
+			n := p.Arena.Nodes[id]
+			if int(n.TokenIdx) == tokIdx && id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				tyStr := chk.Types.Format(chk.NodeTypes[id])
+				if n.Data != 0 && (n.Kind == ast.KindLet || n.Kind == ast.KindLetRec || n.Kind == ast.KindLetMutable || n.Kind == ast.KindIdent) {
+					name := p.Arena.Strings.String(token.StringID(n.Data))
+					return fmt.Sprintf("```fml\nval %s : %s\n```", name, tyStr)
+				}
+				return fmt.Sprintf("```fml\n%s\n```", tyStr)
+			}
+		}
+	}
+
+	// 2. Fallback: look up symbol by name in top-level declarations or global scope
+	if symName != "" {
+		symID := p.Arena.Strings.InternString(symName)
+		for id := 1; id < len(p.Arena.Nodes); id++ {
+			n := p.Arena.Nodes[id]
+			if (n.Kind == ast.KindLet || n.Kind == ast.KindLetRec || n.Kind == ast.KindLetMutable) &&
+				token.StringID(n.Data) == symID && id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				return fmt.Sprintf("```fml\nval %s : %s\n```", symName, chk.Types.Format(chk.NodeTypes[id]))
+			}
+		}
+		if b, found := chk.Scopes[0][symID]; found {
+			return fmt.Sprintf("```fml\nval %s : %s\n```", symName, chk.Types.Format(b.Scheme.Body))
+		}
+	}
+	return ""
+}
+
+func tokenRangeForDecl(p *parser.Parser, startTokIdx int, symName string) lspRange {
+	toks := p.Tokens()
+	if startTokIdx < 0 || startTokIdx >= len(toks) {
+		return lspRange{}
+	}
+	chosen := toks[startTokIdx]
+	for i := startTokIdx; i < len(toks) && i <= startTokIdx+5; i++ {
+		if string(toks[i].Slice(p.Source())) == symName {
+			chosen = toks[i]
+			break
+		}
+	}
+	line := int(chosen.Line) - 1
+	if line < 0 {
+		line = 0
+	}
+	col := int(chosen.Col) - 1
+	if col < 0 {
+		col = 0
+	}
+	spanLen := int(chosen.End - chosen.Start)
+	if spanLen <= 0 {
+		spanLen = len(symName)
+	}
+	return lspRange{
+		Start: lspPosition{Line: line, Character: col},
+		End:   lspPosition{Line: line, Character: col + spanLen},
+	}
+}
+
+func isDeclarationNode(k ast.NodeKind) bool {
+	switch k {
+	case ast.KindLet, ast.KindLetRec, ast.KindLetMutable,
+		ast.KindRecordType, ast.KindDUType, ast.KindDUCase,
+		ast.KindActivePattern, ast.KindLambda, ast.KindModule:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *LSPServer) computeDefinition(uri string, pos lspPosition) *lspLocation {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return nil
+	}
+
+	targetLine := uint16(pos.Line + 1)
+	targetCol := uint16(pos.Character + 1)
+
+	tokIdx := -1
+	var symName string
+	for i, tk := range p.Tokens() {
+		if tk.Line == targetLine {
+			spanLen := uint16(tk.End - tk.Start)
+			if spanLen == 0 {
+				spanLen = 1
+			}
+			if targetCol >= tk.Col && targetCol <= tk.Col+spanLen {
+				tokIdx = i
+				symName = string(tk.Slice(p.Source()))
+				break
+			}
+		}
+	}
+	if symName == "" {
+		return nil
+	}
+	symID := p.Arena.Strings.InternString(symName)
+
+	bestNodeIdx := -1
+	bestTokIdx := -1
+	fallbackNodeIdx := -1
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		if !isDeclarationNode(n.Kind) || token.StringID(n.Data) != symID {
+			continue
+		}
+		if fallbackNodeIdx == -1 {
+			fallbackNodeIdx = id
+		}
+		if int(n.TokenIdx) <= tokIdx && int(n.TokenIdx) >= bestTokIdx {
+			bestTokIdx = int(n.TokenIdx)
+			bestNodeIdx = id
+		}
+	}
+	if bestNodeIdx == -1 {
+		bestNodeIdx = fallbackNodeIdx
+	}
+	if bestNodeIdx == -1 {
+		return nil
+	}
+	declNode := p.Arena.Nodes[bestNodeIdx]
+	return &lspLocation{
+		URI:   uri,
+		Range: tokenRangeForDecl(p, int(declNode.TokenIdx), symName),
+	}
+}
+
+func (s *LSPServer) computeDocumentSymbols(uri string) []lspDocumentSymbol {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return nil
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, _ = chk.Infer(root)
+
+	var stmts []uint32
+	rootNode := p.Arena.Get(root)
+	if rootNode.Kind == ast.KindProgram || rootNode.Kind == ast.KindBlock {
+		stmts = p.Arena.ExtraSlice(rootNode.Left, rootNode.Right)
+	} else {
+		stmts = []uint32{uint32(root)}
+	}
+
+	out := make([]lspDocumentSymbol, 0, len(stmts))
+	for _, rawID := range stmts {
+		id := ast.NodeID(rawID)
+		n := p.Arena.Get(id)
+		if n.Data == 0 {
+			continue
+		}
+		var symKind int
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable:
+			symKind = 13 // Variable
+			if ast.NodeID(n.Left) != ast.NoNode && p.Arena.Get(ast.NodeID(n.Left)).Kind == ast.KindLambda {
+				symKind = 12 // Function
+			}
+		case ast.KindRecordType:
+			symKind = 23 // Struct
+		case ast.KindDUType:
+			symKind = 10 // Enum
+		case ast.KindModule:
+			symKind = 2 // Module
+		case ast.KindActivePattern:
+			symKind = 12 // Function
+		default:
+			continue
+		}
+
+		name := p.Arena.Strings.String(token.StringID(n.Data))
+		var detail string
+		if int(id) < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+			detail = chk.Types.Format(chk.NodeTypes[id])
+		}
+		rng := tokenRangeForDecl(p, int(n.TokenIdx), name)
+		out = append(out, lspDocumentSymbol{
+			Name:           name,
+			Detail:         detail,
+			Kind:           symKind,
+			Range:          rng,
+			SelectionRange: rng,
+		})
+	}
+	return out
+}
+
+var (
+	dotCompletionRe   = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$`)
+	identCompletionRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*)$`)
+)
+
+func (s *LSPServer) computeCompletion(uri string, pos lspPosition) []lspCompletionItem {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	var linePrefix string
+	if pos.Line >= 0 && pos.Line < len(lines) {
+		line := lines[pos.Line]
+		if pos.Character >= 0 && pos.Character <= len(line) {
+			linePrefix = line[:pos.Character]
+		} else {
+			linePrefix = line
+		}
+	}
+
+	arena := ast.NewArena(64, 64, nil)
+	chk := types.NewChecker(arena, nil)
+
+	// 1. Dot-triggered module member completion (`Module.prefix`)
+	if m := dotCompletionRe.FindStringSubmatch(linePrefix); len(m) == 3 {
+		modName := m[1]
+		memPrefix := m[2]
+		prefix := modName + "."
+		var items []lspCompletionItem
+		for symID, b := range chk.Scopes[0] {
+			fullName := arena.Strings.String(symID)
+			if strings.HasPrefix(fullName, prefix) {
+				member := strings.TrimPrefix(fullName, prefix)
+				if strings.HasPrefix(member, memPrefix) {
+					items = append(items, lspCompletionItem{
+						Label:  member,
+						Kind:   3, // Function
+						Detail: chk.Types.Format(b.Scheme.Body),
+					})
+				}
+			}
+		}
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Label < items[j].Label
+		})
+		return items
+	}
+
+	// 2. Identifier / module prefix completion
+	var identPrefix string
+	if m := identCompletionRe.FindStringSubmatch(linePrefix); len(m) == 2 {
+		identPrefix = m[1]
+	}
+
+	seen := make(map[string]bool)
+	var items []lspCompletionItem
+
+	for symID, b := range chk.Scopes[0] {
+		fullName := arena.Strings.String(symID)
+		if idx := strings.IndexByte(fullName, '.'); idx > 0 {
+			modName := fullName[:idx]
+			if !seen[modName] && strings.HasPrefix(modName, identPrefix) {
+				seen[modName] = true
+				items = append(items, lspCompletionItem{
+					Label:  modName,
+					Kind:   9, // Module
+					Detail: "module " + modName,
+				})
+			}
+			continue
+		}
+		if !seen[fullName] && strings.HasPrefix(fullName, identPrefix) {
+			seen[fullName] = true
+			items = append(items, lspCompletionItem{
+				Label:  fullName,
+				Kind:   3, // Function
+				Detail: chk.Types.Format(b.Scheme.Body),
+			})
+		}
+	}
+
+	if p, root, err := parser.ParseSource([]byte(text), nil); err == nil {
+		docChk := types.NewChecker(p.Arena, nil)
+		_, _ = docChk.Infer(root)
+		for id := 1; id < len(p.Arena.Nodes); id++ {
+			n := p.Arena.Nodes[id]
+			if !isDeclarationNode(n.Kind) || n.Data == 0 {
+				continue
+			}
+			name := p.Arena.Strings.String(token.StringID(n.Data))
+			if name == "" || seen[name] || !strings.HasPrefix(name, identPrefix) {
+				continue
+			}
+			seen[name] = true
+			var detail string
+			if id < len(docChk.NodeTypes) && docChk.NodeTypes[id] != types.NoType {
+				detail = docChk.Types.Format(docChk.NodeTypes[id])
+			}
+			items = append(items, lspCompletionItem{
+				Label:  name,
+				Kind:   6, // Variable
+				Detail: detail,
+			})
+		}
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Label < items[j].Label
+	})
+	return items
+}
+
+func (s *LSPServer) computeReferences(uri string, pos lspPosition) []lspLocation {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return nil
+	}
+
+	targetLine := uint16(pos.Line + 1)
+	targetCol := uint16(pos.Character + 1)
+
+	var symName string
+	for _, tk := range p.Tokens() {
+		if tk.Line == targetLine {
+			spanLen := uint16(tk.End - tk.Start)
+			if spanLen == 0 {
+				spanLen = 1
+			}
+			if targetCol >= tk.Col && targetCol <= tk.Col+spanLen {
+				symName = string(tk.Slice(p.Source()))
+				break
+			}
+		}
+	}
+	if symName == "" {
+		return nil
+	}
+
+	var locs []lspLocation
+	for _, tk := range p.Tokens() {
+		if tk.Kind != token.TokenIdent {
+			continue
+		}
+		if string(tk.Slice(p.Source())) != symName {
+			continue
+		}
+		line := int(tk.Line) - 1
+		if line < 0 {
+			line = 0
+		}
+		col := int(tk.Col) - 1
+		if col < 0 {
+			col = 0
+		}
+		spanLen := int(tk.End - tk.Start)
+		if spanLen <= 0 {
+			spanLen = len(symName)
+		}
+		locs = append(locs, lspLocation{
+			URI: uri,
+			Range: lspRange{
+				Start: lspPosition{Line: line, Character: col},
+				End:   lspPosition{Line: line, Character: col + spanLen},
+			},
+		})
+	}
+	return locs
+}
+
+func (s *LSPServer) sendResponse(id json.RawMessage, result any) {
+	resp := rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  result,
+	}
+	s.writeFrame(resp)
+}
+
+func (s *LSPServer) sendNotification(method string, params any) {
+	rawParams, _ := json.Marshal(params)
+	notif := rpcMessage{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  rawParams,
+	}
+	s.writeFrame(notif)
+}
+
+func (s *LSPServer) writeFrame(msg rpcMessage) {
+	if s.Out == nil {
+		return
+	}
+	var bodyBuf bytes.Buffer
+	enc := json.NewEncoder(&bodyBuf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(msg); err != nil {
+		return
+	}
+	body := bytes.TrimRight(bodyBuf.Bytes(), "\n")
+	var frame bytes.Buffer
+	fmt.Fprintf(&frame, "Content-Length: %d\r\n\r\n", len(body))
+	frame.Write(body)
+	_, _ = s.Out.Write(frame.Bytes())
+}
