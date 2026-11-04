@@ -328,6 +328,8 @@ First-class code quotations `<@ expr @>` reify FML expressions into the built-in
 | `Regex` | `Regex.isMatch`, `Regex.find`, `Regex.findAll`, `Regex.replace`, `Regex.split` |
 | `Math` | `Math.pi`, `Math.abs`, `Math.min`, `Math.max`, `Math.sqrt`, `Math.pow`, `Math.sin`, `Math.cos`, `Math.floor`, `Math.ceil`, `Math.round` |
 | `Time` | `Time.nowUnixMs`, `Time.sleepMs`, `Time.measureMs` |
+| `Sys` | `Sys.args`, `Sys.getenv`, `Sys.setenv`, `Sys.cwd`, `Sys.fileExists` |
+| `Crypto` | `Crypto.sha256`, `Crypto.hmacSha256`, `Crypto.base64Encode`, `Crypto.base64Decode`, `Crypto.uuid4` |
 | `Test` | `Test.assert`, `Test.assertEq`, `Test.forall` (QuickCheck-style property verification) |
 | `Csv` / `Env` | `Csv.decode`, `Env.decode` (backing runtime parsers for `CsvProvider` & `EnvProvider`) |
 

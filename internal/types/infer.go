@@ -293,6 +293,20 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Time.nowUnixMs"), TypeScheme{Body: arrow(TypeUnit, TypeInt)}, false)
 	c.define(s.InternString("Time.sleepMs"), TypeScheme{Body: arrow(TypeInt, TypeUnit)}, false)
 	c.define(s.InternString("Time.measureMs"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(TypeUnit, a), measuredPairTy)}, false)
+
+	// Sys combinators
+	c.define(s.InternString("Sys.args"), TypeScheme{Body: arrow(TypeUnit, listOf(TypeString))}, false)
+	c.define(s.InternString("Sys.getenv"), TypeScheme{Body: arrow(TypeString, optOf(TypeString))}, false)
+	c.define(s.InternString("Sys.setenv"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeUnit))}, false)
+	c.define(s.InternString("Sys.cwd"), TypeScheme{Body: arrow(TypeUnit, TypeString)}, false)
+	c.define(s.InternString("Sys.fileExists"), TypeScheme{Body: arrow(TypeString, TypeBool)}, false)
+
+	// Crypto combinators
+	c.define(s.InternString("Crypto.sha256"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+	c.define(s.InternString("Crypto.hmacSha256"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeString))}, false)
+	c.define(s.InternString("Crypto.base64Encode"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+	c.define(s.InternString("Crypto.base64Decode"), TypeScheme{Body: arrow(TypeString, resOf(TypeString, TypeString))}, false)
+	c.define(s.InternString("Crypto.uuid4"), TypeScheme{Body: arrow(TypeUnit, TypeString)}, false)
 }
 
 func (c *Checker) pushScope() {

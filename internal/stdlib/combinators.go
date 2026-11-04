@@ -1,8 +1,14 @@
 package stdlib
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"math"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,7 +19,7 @@ import (
 )
 
 // RegisterCombinators binds the higher-order `List`, `Array`, `String`,
-// `Option`, `Result`, `Regex`, `Math`, `Time`, and `Test` combinator modules into vm.
+// `Option`, `Result`, `Regex`, `Math`, `Time`, `Sys`, `Crypto`, and `Test` combinator modules into vm.
 //
 // Jaime says: Every functional language lives or dies by its collection and
 // option/result combinators. Convert singly-linked lists to flat Go slices on
@@ -28,6 +34,8 @@ func RegisterCombinators(vm *runtime.VM) {
 	registerRegexModule(vm)
 	registerMathModule(vm)
 	registerTimeModule(vm)
+	registerSysModule(vm)
+	registerCryptoModule(vm)
 	registerTestModule(vm)
 }
 
@@ -916,6 +924,151 @@ func registerTimeModule(vm *runtime.VM) {
 		"nowUnixMs": timeNowUnixMs,
 		"sleepMs":   timeSleepMs,
 		"measureMs": timeMeasureMs,
+	})
+}
+
+func registerSysModule(vm *runtime.VM) {
+	someTag := vm.Prog.Strings.InternString("Some")
+	noneTag := vm.Prog.Strings.InternString("None")
+
+	sysArgs := &runtime.BuiltinVal{
+		Name:  "Sys.args",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
+			elems := make([]runtime.Value, len(os.Args))
+			for i, a := range os.Args {
+				elems[i] = runtime.StringVal{V: a}
+			}
+			return runtime.SliceToList(elems), nil
+		},
+	}
+
+	sysGetenv := &runtime.BuiltinVal{
+		Name:  "Sys.getenv",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			key := runtime.Deref(args[0]).String()
+			if val, ok := os.LookupEnv(key); ok {
+				return runtime.ADTVal{Tag: someTag, TagName: "Some", Payload: runtime.StringVal{V: val}}, nil
+			}
+			return runtime.ADTVal{Tag: noneTag, TagName: "None"}, nil
+		},
+	}
+
+	sysSetenv := &runtime.BuiltinVal{
+		Name:  "Sys.setenv",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			key := runtime.Deref(args[0]).String()
+			val := runtime.Deref(args[1]).String()
+			if err := os.Setenv(key, val); err != nil {
+				return nil, err
+			}
+			return runtime.Unit, nil
+		},
+	}
+
+	sysCwd := &runtime.BuiltinVal{
+		Name:  "Sys.cwd",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
+			wd, err := os.Getwd()
+			if err != nil {
+				return nil, err
+			}
+			return runtime.StringVal{V: wd}, nil
+		},
+	}
+
+	sysFileExists := &runtime.BuiltinVal{
+		Name:  "Sys.fileExists",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			path := runtime.Deref(args[0]).String()
+			_, err := os.Stat(path)
+			return runtime.BoolVal{V: err == nil}, nil
+		},
+	}
+
+	defineModuleRecord(vm, "Sys", map[string]runtime.Value{
+		"args":       sysArgs,
+		"getenv":     sysGetenv,
+		"setenv":     sysSetenv,
+		"cwd":        sysCwd,
+		"fileExists": sysFileExists,
+	})
+}
+
+func registerCryptoModule(vm *runtime.VM) {
+	okTag := vm.Prog.Strings.InternString("Ok")
+	errTag := vm.Prog.Strings.InternString("Error")
+
+	cryptoSha256 := &runtime.BuiltinVal{
+		Name:  "Crypto.sha256",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			msg := runtime.Deref(args[0]).String()
+			sum := sha256.Sum256([]byte(msg))
+			return runtime.StringVal{V: hex.EncodeToString(sum[:])}, nil
+		},
+	}
+
+	cryptoHmacSha256 := &runtime.BuiltinVal{
+		Name:  "Crypto.hmacSha256",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			key := runtime.Deref(args[0]).String()
+			msg := runtime.Deref(args[1]).String()
+			mac := hmac.New(sha256.New, []byte(key))
+			mac.Write([]byte(msg))
+			return runtime.StringVal{V: hex.EncodeToString(mac.Sum(nil))}, nil
+		},
+	}
+
+	cryptoBase64Encode := &runtime.BuiltinVal{
+		Name:  "Crypto.base64Encode",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			msg := runtime.Deref(args[0]).String()
+			return runtime.StringVal{V: base64.StdEncoding.EncodeToString([]byte(msg))}, nil
+		},
+	}
+
+	cryptoBase64Decode := &runtime.BuiltinVal{
+		Name:  "Crypto.base64Decode",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			encoded := runtime.Deref(args[0]).String()
+			decoded, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				return runtime.ADTVal{Tag: errTag, TagName: "Error", Payload: runtime.StringVal{V: err.Error()}}, nil
+			}
+			return runtime.ADTVal{Tag: okTag, TagName: "Ok", Payload: runtime.StringVal{V: string(decoded)}}, nil
+		},
+	}
+
+	cryptoUuid4 := &runtime.BuiltinVal{
+		Name:  "Crypto.uuid4",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
+			var b [16]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return nil, err
+			}
+			b[6] = (b[6] & 0x0f) | 0x40
+			b[8] = (b[8] & 0x3f) | 0x80
+			uuid := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+				b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+			return runtime.StringVal{V: uuid}, nil
+		},
+	}
+
+	defineModuleRecord(vm, "Crypto", map[string]runtime.Value{
+		"sha256":       cryptoSha256,
+		"hmacSha256":   cryptoHmacSha256,
+		"base64Encode": cryptoBase64Encode,
+		"base64Decode": cryptoBase64Decode,
+		"uuid4":        cryptoUuid4,
 	})
 }
 

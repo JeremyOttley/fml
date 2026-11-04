@@ -145,5 +145,38 @@ else
 	}
 }
 
+func TestSysAndCryptoModules(t *testing.T) {
+	src := `
+Sys.setenv "FML_TEST_ENV_KEY" "fml_secret_42"
+let envOpt = Sys.getenv "FML_TEST_ENV_KEY"
+let envVal = Option.defaultValue "" envOpt
+let missingOpt = Sys.getenv "FML_NONEXISTENT_KEY_99999"
+let isMissing = Option.isNone missingOpt
+
+let wd = Sys.cwd ()
+let args = Sys.args ()
+let exists = Sys.fileExists "combinators.go"
+
+let hash = Crypto.sha256 "fml"
+let mac = Crypto.hmacSha256 "key" "message"
+let b64 = Crypto.base64Encode "hello-fml"
+let decoded = Crypto.base64Decode b64 |> Result.defaultValue ""
+let badDecode = Crypto.base64Decode "!!!not_base64!!!"
+let isDecodeErr = Result.isError badDecode
+let id1 = Crypto.uuid4 ()
+let id2 = Crypto.uuid4 ()
+
+if (envVal == "fml_secret_42") && isMissing && (String.length wd > 0) && (List.length args >= 1) && exists && (String.length hash == 64) && (String.length mac == 64) && (decoded == "hello-fml") && isDecodeErr && (String.length id1 == 36) && (id1 != id2) then
+    100
+else
+    0
+`
+	val := evalFML(t, src)
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 100 {
+		t.Fatalf("expected 100 from Sys and Crypto module operations, got %v", val)
+	}
+}
+
+
 
 
