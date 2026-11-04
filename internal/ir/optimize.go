@@ -30,14 +30,22 @@ func Optimize(prog *Program) {
 		constEnv := make(map[token.StringID]IRInstr)
 		copyEnv := make(map[token.StringID]token.StringID)
 		fnEnv := make(map[token.StringID]IRInstr)
+		allocEnv := make(map[token.StringID]IRInstr)
+		userSyms := make(map[token.StringID]bool)
 
 		// Collect single-assignment immutable IRLet bindings first so scoped `let ... in body`
 		// bindings (where IRLet has a higher InstrID than body) propagate in a single pass.
 		for _, ins := range prog.Instrs {
+			if ins.Kind == IRFn && ins.Data != 0 {
+				userSyms[token.StringID(ins.Data)] = true
+			}
 			if ins.Kind != IRLet {
 				continue
 			}
 			sym := token.StringID(ins.Data)
+			if sym != token.NoString {
+				userSyms[sym] = true
+			}
 			if sym != token.NoString && ins.Flags == 0 && !unsafeSyms[sym] && int(ins.Arg0) < len(prog.Instrs) {
 				rhs := prog.Instrs[ins.Arg0]
 				switch rhs.Kind {
@@ -51,9 +59,16 @@ func Optimize(prog *Program) {
 						} else {
 							copyEnv[sym] = srcSym
 						}
+						if aIns, ok := allocEnv[srcSym]; ok {
+							allocEnv[sym] = aIns
+						}
 					}
 				case IRFn:
 					fnEnv[sym] = rhs
+				case IRAlloc:
+					if isPureExpr(prog, rhs, unsafeSyms) {
+						allocEnv[sym] = rhs
+					}
 				}
 			}
 		}
@@ -72,13 +87,19 @@ func Optimize(prog *Program) {
 				}
 
 			case IRApp:
-				if inlined, ok := tryInlineApp(prog, ins, fnEnv, unsafeSyms); ok {
+				if inlined, ok := tryInlineApp(prog, ins, fnEnv, userSyms, unsafeSyms); ok {
 					prog.Instrs[i] = inlined
 					changed = true
 				}
 
 			case IRPrim:
 				if folded, ok := tryFoldPrim(prog, ins, unsafeSyms); ok {
+					prog.Instrs[i] = folded
+					changed = true
+				}
+
+			case IRLoad:
+				if folded, ok := tryFoldLoad(prog, ins, allocEnv, unsafeSyms); ok {
 					prog.Instrs[i] = folded
 					changed = true
 				}
@@ -147,16 +168,30 @@ func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
 	return unsafe
 }
 
-func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	if int(appIns.Arg0) >= len(prog.Instrs) || int(appIns.Arg1) >= len(prog.Instrs) {
 		return IRInstr{}, false
 	}
+	fnIns := prog.Instrs[appIns.Arg0]
+	if fnIns.Kind == IRVar {
+		fnSym := token.StringID(fnIns.Data)
+		if !userSyms[fnSym] && !unsafeSyms[fnSym] && prog.Strings != nil {
+			switch prog.Strings.String(fnSym) {
+			case "id":
+				return prog.Instrs[appIns.Arg1], true
+			case "fst":
+				return IRInstr{Kind: IRLoad, SubOp: LoadTupleElem, Arg0: appIns.Arg1, Arg1: 0}, true
+			case "snd":
+				return IRInstr{Kind: IRLoad, SubOp: LoadTupleElem, Arg0: appIns.Arg1, Arg1: 1}, true
+			}
+		}
+	}
+
 	argIns := prog.Instrs[appIns.Arg1]
 	if argIns.Kind != IRConst {
 		return IRInstr{}, false
 	}
 
-	fnIns := prog.Instrs[appIns.Arg0]
 	if fnIns.Kind == IRVar {
 		lookedUp, ok := fnEnv[token.StringID(fnIns.Data)]
 		if !ok {
@@ -269,6 +304,70 @@ func eliminateDeadBindings(prog *Program, unsafeSyms map[token.StringID]bool) bo
 	return changed
 }
 
+func tryFoldLoad(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+	if int(ins.Arg0) >= len(prog.Instrs) {
+		return IRInstr{}, false
+	}
+	srcIns := prog.Instrs[ins.Arg0]
+	if srcIns.Kind == IRVar {
+		sym := token.StringID(srcIns.Data)
+		if !unsafeSyms[sym] {
+			if lookedUp, ok := allocEnv[sym]; ok {
+				srcIns = lookedUp
+			}
+		}
+	}
+	if srcIns.Kind != IRAlloc || !isPureExpr(prog, srcIns, unsafeSyms) {
+		return IRInstr{}, false
+	}
+
+	switch ins.SubOp {
+	case LoadTupleElem:
+		if srcIns.SubOp == AllocTuple && ins.Arg1 < srcIns.Arg1 && int(srcIns.Arg0+ins.Arg1) < len(prog.Extra) {
+			elemID := prog.Extra[srcIns.Arg0+ins.Arg1]
+			if int(elemID) < len(prog.Instrs) {
+				return prog.Instrs[elemID], true
+			}
+		}
+	case LoadRecordField:
+		if srcIns.SubOp == AllocRecord {
+			wantField := uint32(ins.Data)
+			for j := uint32(0); j+1 < srcIns.Arg1; j += 2 {
+				if int(srcIns.Arg0+j+1) < len(prog.Extra) && prog.Extra[srcIns.Arg0+j] == wantField {
+					valID := prog.Extra[srcIns.Arg0+j+1]
+					if int(valID) < len(prog.Instrs) {
+						return prog.Instrs[valID], true
+					}
+				}
+			}
+		}
+	case LoadADTTag:
+		if srcIns.SubOp == AllocADT {
+			return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: srcIns.Data}, true
+		}
+	case LoadADTPayload:
+		if srcIns.SubOp == AllocADT && InstrID(srcIns.Arg0) != NoInstr && int(srcIns.Arg0) < len(prog.Instrs) {
+			return prog.Instrs[srcIns.Arg0], true
+		}
+	case LoadListIsEmpty:
+		if srcIns.SubOp == AllocList {
+			isEmpty := uint64(0)
+			if srcIns.Arg1 == 0 {
+				isEmpty = 1
+			}
+			return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: isEmpty}, true
+		}
+	case LoadListHead:
+		if srcIns.SubOp == AllocList && srcIns.Arg1 > 0 && int(srcIns.Arg0) < len(prog.Extra) {
+			headID := prog.Extra[srcIns.Arg0]
+			if int(headID) < len(prog.Instrs) {
+				return prog.Instrs[headID], true
+			}
+		}
+	}
+	return IRInstr{}, false
+}
+
 func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) bool {
 	switch ins.Kind {
 	case IRConst, IRFn:
@@ -283,6 +382,40 @@ func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) 
 			return int(ins.Arg0) < len(prog.Instrs) && int(ins.Arg1) < len(prog.Instrs) &&
 				isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms) &&
 				isPureExpr(prog, prog.Instrs[ins.Arg1], unsafeSyms)
+		}
+	case IRAlloc:
+		switch ins.SubOp {
+		case AllocADT:
+			if InstrID(ins.Arg0) == NoInstr {
+				return true
+			}
+			return int(ins.Arg0) < len(prog.Instrs) && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms)
+		case AllocTuple, AllocList:
+			for i := uint32(0); i < ins.Arg1; i++ {
+				idx := ins.Arg0 + i
+				if int(idx) >= len(prog.Extra) || int(prog.Extra[idx]) >= len(prog.Instrs) ||
+					!isPureExpr(prog, prog.Instrs[prog.Extra[idx]], unsafeSyms) {
+					return false
+				}
+			}
+			return true
+		case AllocRecord:
+			if ins.Flags != 0 {
+				return false
+			}
+			for i := uint32(0); i+1 < ins.Arg1; i += 2 {
+				valIdx := ins.Arg0 + i + 1
+				if int(valIdx) >= len(prog.Extra) || int(prog.Extra[valIdx]) >= len(prog.Instrs) ||
+					!isPureExpr(prog, prog.Instrs[prog.Extra[valIdx]], unsafeSyms) {
+					return false
+				}
+			}
+			return true
+		}
+	case IRLoad:
+		switch ins.SubOp {
+		case LoadTupleElem, LoadRecordField, LoadADTPayload, LoadADTTag, LoadListHead, LoadListTail, LoadListIsEmpty:
+			return int(ins.Arg0) < len(prog.Instrs) && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms)
 		}
 	}
 	return false

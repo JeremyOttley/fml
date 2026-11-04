@@ -100,4 +100,41 @@ fun (x: int) (y: int) ->
 	}
 }
 
+func TestContainerProjectionFoldingAndADTMatchElimination(t *testing.T) {
+	src := []byte(`
+type Endpoint = { Host: string; Port: int }
+let ep = { Host = "127.0.0.1"; Port = 8000 }
+let pair = (20, 22)
+let wrapped = Some 40
+
+let extracted =
+    match wrapped with
+    | Some v -> v
+    | None -> 0
+
+let tupVal =
+    match pair with
+    | (a, b) -> a + b
+
+ep.Port + extracted + tupVal + (fst pair) + (snd pair) + (id 16)
+`)
+	p, root, err := parser.ParseSource(src, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	if _, err := chk.Infer(root); err != nil {
+		t.Fatalf("infer failed: %v", err)
+	}
+	prog := Lower(p.Arena, chk.Types, root)
+	Optimize(prog)
+
+	// 8000 + 40 + 42 + 20 + 22 + 16 = 8140
+	rootInstr := prog.Instrs[prog.Root]
+	if rootInstr.Kind != IRConst || rootInstr.SubOp != ConstInt || int64(rootInstr.Data) != 8140 {
+		t.Fatalf("expected record, tuple, fst/snd/id, and ADT match projections to fold into IRConst(8140), got %+v", rootInstr)
+	}
+}
+
+
 

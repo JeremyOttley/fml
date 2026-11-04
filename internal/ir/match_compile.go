@@ -151,10 +151,10 @@ func (l *Lowerer) compileRemainingArm(arms []uint32, idx int, scrutVar, dispatch
 
 	// Build pattern condition check if not a wildcard/var
 	condInstr := l.emitPatternCondition(pat, dispatchVal)
-	bindings := l.emitPatternBindings(patID, scrutVar)
 
 	var bodyWithGuard InstrID
 	if arm.Data != 0 {
+		bindings := l.emitPatternBindings(patID, scrutVar)
 		guardNode := l.AST.Get(ast.NodeID(arm.Data))
 		guardExpr := l.lowerNode(ast.NodeID(guardNode.Left), false)
 		bodyExpr := l.lowerNode(ast.NodeID(arm.Right), tailPos)
