@@ -330,8 +330,59 @@ func TestLSPSemanticTokensAndWorkspaceSymbols(t *testing.T) {
 	}
 }
 
+func TestFormatFullSyntaxRoundTrip(t *testing.T) {
+	src := strings.Join([]string{
+		"[<Measure>] type m",
+		"[<Measure>] type s",
+		"type Point = { X: int; Y: int }",
+		"type Shape = Circle of int | Box of int * int | Origin",
+		"let speed = 20.0<m> / 4.0<s>",
+		"let area s =",
+		"    match s with",
+		"    | Circle r when r > 0 -> r * r",
+		"    | Box (w, h) -> w * h",
+		"    | _ -> 0",
+		"let optVal =",
+		"    option {",
+		"        let! a = Some 10",
+		"        let! b = Some 20",
+		"        return a + b",
+		"    }",
+		"let arr = [| 1; 2; 3 |]",
+		"let quoted = <@ 1 + 2 @>",
+		"let total =",
+		"    let mutable acc = 0",
+		"    for i = 1 to 3 do",
+		"        acc <- acc + i",
+		"    acc + area (Box (3, 4)) + Array.length arr",
+		"total",
+	}, "\n") + "\n"
 
+	formatted1, err := FormatSource([]byte(src), 80)
+	if err != nil {
+		t.Fatalf("FormatSource first pass failed: %v", err)
+	}
+	formatted2, err := FormatSource([]byte(formatted1), 80)
+	if err != nil {
+		t.Fatalf("FormatSource second pass failed: %v\nformatted1:\n%s", err, formatted1)
+	}
+	if formatted1 != formatted2 {
+		t.Fatalf("FormatSource is not idempotent:\n--- pass 1 ---\n%s\n--- pass 2 ---\n%s", formatted1, formatted2)
+	}
 
-
-
+	var outOrig, outFmt bytes.Buffer
+	sessOrig := NewSession(&outOrig)
+	resOrig, err := sessOrig.EvalLine(src)
+	if err != nil {
+		t.Fatalf("EvalLine on original failed: %v", err)
+	}
+	sessFmt := NewSession(&outFmt)
+	resFmt, err := sessFmt.EvalLine(formatted1)
+	if err != nil {
+		t.Fatalf("EvalLine on formatted failed: %v\nformatted:\n%s", err, formatted1)
+	}
+	if resOrig != resFmt || !strings.Contains(resFmt, "val it : int = 21") {
+		t.Fatalf("expected identical evaluation with 'val it : int = 21', got orig:\n%s\nfmt:\n%s\nformatted:\n%s", resOrig, resFmt, formatted1)
+	}
+}
 
