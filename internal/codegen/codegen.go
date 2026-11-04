@@ -474,13 +474,14 @@ func joinScalar(a, b scalarKind) scalarKind {
 }
 
 type aotNativeFn struct {
-	letID      ir.InstrID
-	name       string
-	paramDefs  []ir.InstrID
-	paramKinds []scalarKind
-	bodyID     ir.InstrID
-	retKind    scalarKind
-	bodyCode   string
+	letID       ir.InstrID
+	name        string
+	paramDefs   []ir.InstrID
+	paramKinds  []scalarKind
+	bodyID      ir.InstrID
+	retKind     scalarKind
+	bodyCode    string
+	hasTailLoop bool
 }
 
 type aotScalarInfo struct {
@@ -813,12 +814,13 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 			for k, pDef := range fn.paramDefs {
 				localVars[pDef] = fmt.Sprintf("p_%d", k)
 			}
-			bodyCode, ok := emitNativeBlock(prog, fn.bodyID, fn.retKind, info, candidates, localVars)
+			bodyCode, ok := emitNativeBlock(prog, fn.bodyID, fn.retKind, info, candidates, localVars, letID)
 			if !ok {
 				delete(candidates, letID)
 				removed = true
 			} else {
 				fn.bodyCode = bodyCode
+				fn.hasTailLoop = strings.Contains(bodyCode, "continue aotTailLoop")
 			}
 		}
 		if !removed {
@@ -863,12 +865,18 @@ func emitAOTNativeFunctions(buf *bytes.Buffer, _ *ir.Program, scalars *aotScalar
 		}
 		fmt.Fprintf(buf, "// Native unboxed Go function for %s\n", fn.name)
 		fmt.Fprintf(buf, "func aotFn_%d(%s) %s {\n", fn.letID, strings.Join(params, ", "), goTypeForScalar(fn.retKind))
-		buf.WriteString(fn.bodyCode)
+		if fn.hasTailLoop {
+			buf.WriteString("aotTailLoop:\n\tfor {\n")
+			buf.WriteString(fn.bodyCode)
+			buf.WriteString("\t}\n")
+		} else {
+			buf.WriteString(fn.bodyCode)
+		}
 		buf.WriteString("}\n\n")
 	}
 }
 
-func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalars *aotScalarInfo, candidates map[ir.InstrID]*aotNativeFn, localVars map[ir.InstrID]string) (string, bool) {
+func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalars *aotScalarInfo, candidates map[ir.InstrID]*aotNativeFn, localVars map[ir.InstrID]string, selfLetID ir.InstrID) (string, bool) {
 	if id == ir.NoInstr || int(id) >= len(prog.Instrs) {
 		return "", false
 	}
@@ -893,7 +901,7 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalar
 		}
 		localName := fmt.Sprintf("local_%d", id)
 		nextVars[id] = localName
-		restCode, ok := emitNativeBlock(prog, ir.InstrID(ins.Arg1), retKind, scalars, candidates, nextVars)
+		restCode, ok := emitNativeBlock(prog, ir.InstrID(ins.Arg1), retKind, scalars, candidates, nextVars, selfLetID)
 		if !ok {
 			return "", false
 		}
@@ -935,7 +943,7 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalar
 				lets = append(lets, pendingLet{name: localName, rhs: rhsExpr})
 			}
 			lastChild := ir.InstrID(prog.Extra[ins.Arg0+ins.Arg1-1])
-			tailCode, ok := emitNativeBlock(prog, lastChild, retKind, scalars, candidates, nextVars)
+			tailCode, ok := emitNativeBlock(prog, lastChild, retKind, scalars, candidates, nextVars, selfLetID)
 			if !ok {
 				return "", false
 			}
@@ -954,8 +962,8 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalar
 			target := ir.InstrID(prog.Extra[ins.Arg1+1])
 			if caseTag == 0 || caseTag == 1 {
 				if condExpr, ok := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarBool, scalars, candidates, localVars); ok {
-					targetCode, okT := emitNativeBlock(prog, target, retKind, scalars, candidates, localVars)
-					auxCode, okA := emitNativeBlock(prog, ir.InstrID(ins.Aux), retKind, scalars, candidates, localVars)
+					targetCode, okT := emitNativeBlock(prog, target, retKind, scalars, candidates, localVars, selfLetID)
+					auxCode, okA := emitNativeBlock(prog, ir.InstrID(ins.Aux), retKind, scalars, candidates, localVars, selfLetID)
 					if okT && okA {
 						if caseTag == 1 {
 							return fmt.Sprintf("\tif %s {\n%s\t}\n%s", condExpr, targetCode, auxCode), true
@@ -976,13 +984,13 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalar
 					continue
 				}
 				seenTags[caseTag] = true
-				cCode, okC := emitNativeBlock(prog, target, retKind, scalars, candidates, localVars)
+				cCode, okC := emitNativeBlock(prog, target, retKind, scalars, candidates, localVars, selfLetID)
 				if !okC {
 					return "", false
 				}
 				fmt.Fprintf(&sb, "\tcase %d:\n%s", caseTag, cCode)
 			}
-			dCode, okD := emitNativeBlock(prog, ir.InstrID(ins.Aux), retKind, scalars, candidates, localVars)
+			dCode, okD := emitNativeBlock(prog, ir.InstrID(ins.Aux), retKind, scalars, candidates, localVars, selfLetID)
 			if !okD {
 				return "", false
 			}
@@ -990,6 +998,35 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, scalar
 			return sb.String(), true
 		}
 		return "", false
+
+	case ir.IRApp:
+		if selfFn, okSelf := candidates[selfLetID]; okSelf && selfFn != nil {
+			var revArgs []ir.InstrID
+			spine := id
+			for spine != ir.NoInstr && int(spine) < len(prog.Instrs) && prog.Instrs[spine].Kind == ir.IRApp {
+				revArgs = append(revArgs, ir.InstrID(prog.Instrs[spine].Arg1))
+				spine = ir.InstrID(prog.Instrs[spine].Arg0)
+			}
+			if defID, okDef := scalars.varDef[spine]; okDef && defID == selfLetID && len(revArgs) == len(selfFn.paramDefs) {
+				lhsParams := make([]string, len(revArgs))
+				rhsArgs := make([]string, len(revArgs))
+				allArgsOK := true
+				for k := 0; k < len(revArgs); k++ {
+					argID := revArgs[len(revArgs)-1-k]
+					aExpr, okA := nativeScalarExpr(prog, argID, selfFn.paramKinds[k], scalars, candidates, localVars)
+					if !okA {
+						allArgsOK = false
+						break
+					}
+					lhsParams[k] = fmt.Sprintf("p_%d", k)
+					rhsArgs[k] = aExpr
+				}
+				if allArgsOK {
+					return fmt.Sprintf("\t// Native tail-call loop step (zero-allocation TCO)\n\t%s = %s\n\tcontinue aotTailLoop\n",
+						strings.Join(lhsParams, ", "), strings.Join(rhsArgs, ", ")), true
+				}
+			}
+		}
 	}
 
 	expr, ok := nativeScalarExpr(prog, id, retKind, scalars, candidates, localVars)
@@ -1103,6 +1140,17 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 							}
 							return fmt.Sprintf("(%s %s int64(%d))", lhs, op, int64(rIns.Data)), true
 						}
+					}
+				}
+				if localVars != nil {
+					lhs, okL := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarInt, scalars, candidates, localVars)
+					rhs, okR := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarInt, scalars, candidates, localVars)
+					if okL && okR {
+						op := "/"
+						if ins.SubOp == ir.PrimMod {
+							op = "%"
+						}
+						return fmt.Sprintf("(%s %s %s)", lhs, op, rhs), true
 					}
 				}
 			}

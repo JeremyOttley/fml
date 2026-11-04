@@ -364,5 +364,63 @@ printfn f20
 	}
 }
 
+func TestAOTNativeTailCallLoopLowering(t *testing.T) {
+	src := `
+let rec gcd (a: int) (b: int) =
+    if b == 0 then a
+    else gcd b (a % b)
+
+let rec sumTo (n: int) (acc: int) =
+    if n <= 0 then acc
+    else sumTo (n - 1) (acc + n)
+
+printfn (gcd 1071 462)
+printfn (sumTo 1000000 0)
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_tco.fml")
+	binPath := filepath.Join(tmpDir, "native_tco_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for gcd",
+		"// Native unboxed Go function for sumTo",
+		"aotTailLoop:",
+		"// Native tail-call loop step (zero-allocation TCO)",
+		"p_0, p_1 =",
+		"continue aotTailLoop",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 || strings.TrimSpace(lines[0]) != "21" || strings.TrimSpace(lines[1]) != "500000500000" {
+		t.Fatalf("expected output lines ['21', '500000500000'], got %v", lines)
+	}
+}
+
+
 
 
