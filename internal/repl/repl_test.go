@@ -252,6 +252,48 @@ func TestLSPSignatureHelpAndExhaustivenessCodeAction(t *testing.T) {
 	}
 }
 
+func TestLSPInlayHints(t *testing.T) {
+	doc := strings.Join([]string{
+		"[<Measure>] type m",
+		"[<Measure>] type s",
+		"let dist = 100.0<m>",
+		"let time = 10.0<s>",
+		"let velocity = dist / time",
+		"let scale factor = velocity * factor",
+		"let mapped = List.map (fun x -> x + 1) [1; 2; 3]",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///hints.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/inlayHint","params":{"textDocument":{"uri":"file:///hints.fml"},"range":{"start":{"line":0,"character":0},"end":{"line":10,"character":0}}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"inlayHintProvider":true`,
+		`"label":": float<m>"`,
+		`"label":": float<s>"`,
+		`"label":": float<m*s^-1>"`,
+		`"label":": float"`,
+		`"label":": int list"`,
+		`"label":": int"`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in inlayHint response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
 
 
 

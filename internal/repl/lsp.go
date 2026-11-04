@@ -106,6 +106,13 @@ type lspCodeAction struct {
 	Edit  *lspWorkspaceEdit `json:"edit,omitempty"`
 }
 
+type lspInlayHint struct {
+	Position    lspPosition `json:"position"`
+	Label       string      `json:"label"`
+	Kind        int         `json:"kind,omitempty"`
+	PaddingLeft bool        `json:"paddingLeft,omitempty"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -191,6 +198,7 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"renameProvider":             true,
 				"documentFormattingProvider": true,
 				"codeActionProvider":         true,
+				"inlayHintProvider":          true,
 				"signatureHelpProvider": map[string]any{
 					"triggerCharacters": []string{" ", "("},
 				},
@@ -360,6 +368,18 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			actions := s.computeCodeActions(params.TextDocument.URI, params.Range)
 			s.sendResponse(msg.ID, actions)
+		}
+
+	case "textDocument/inlayHint":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Range lspRange `json:"range"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			hints := s.computeInlayHints(params.TextDocument.URI, params.Range)
+			s.sendResponse(msg.ID, hints)
 		}
 
 	case "shutdown":
@@ -1097,6 +1117,133 @@ func (s *LSPServer) computeCodeActions(uri string, _ lspRange) []lspCodeAction {
 			},
 		},
 	}
+}
+
+func (s *LSPServer) computeInlayHints(uri string, rng lspRange) []lspInlayHint {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return nil
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, _ = chk.Infer(root)
+
+	toks := p.Tokens()
+	src := p.Source()
+	filterRange := rng.End.Line > 0 || rng.End.Character > 0
+
+	var hints []lspInlayHint
+	seenPos := make(map[[2]int]bool)
+	addHint := func(pos lspPosition, label string) {
+		if filterRange && (pos.Line < rng.Start.Line || pos.Line > rng.End.Line) {
+			return
+		}
+		key := [2]int{pos.Line, pos.Character}
+		if seenPos[key] {
+			return
+		}
+		seenPos[key] = true
+		hints = append(hints, lspInlayHint{
+			Position: pos,
+			Label:    label,
+			Kind:     1, // InlayHintKind.Type
+		})
+	}
+
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			if n.Op == 1 || n.Data == 0 {
+				continue
+			}
+			symName := p.Arena.Strings.String(token.StringID(n.Data))
+			if symName == "" || symName == "_" || strings.HasPrefix(symName, "__") {
+				continue
+			}
+			lhsID := ast.NodeID(n.Left)
+			if lhsID != ast.NoNode {
+				lhsKind := p.Arena.Get(lhsID).Kind
+				if lhsKind == ast.KindLambda || lhsKind == ast.KindTypeAnnot {
+					continue
+				}
+			}
+			nameTokIdx := -1
+			startIdx := int(n.TokenIdx)
+			for i := startIdx; i < len(toks) && i <= startIdx+5; i++ {
+				if string(toks[i].Slice(src)) == symName {
+					nameTokIdx = i
+					break
+				}
+			}
+			if nameTokIdx < 0 || (nameTokIdx+1 < len(toks) && toks[nameTokIdx+1].Kind == token.TokenColon) {
+				continue
+			}
+			if id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				tyStr := chk.Types.Format(chk.NodeTypes[id])
+				tk := toks[nameTokIdx]
+				spanLen := int(tk.End - tk.Start)
+				if spanLen <= 0 {
+					spanLen = len(symName)
+				}
+				pos := lspPosition{
+					Line:      max(0, int(tk.Line)-1),
+					Character: max(0, int(tk.Col)-1) + spanLen,
+				}
+				addHint(pos, ": "+tyStr)
+			}
+
+		case ast.KindLambda:
+			paramID := ast.NodeID(n.Left)
+			if paramID == ast.NoNode {
+				continue
+			}
+			paramNode := p.Arena.Get(paramID)
+			if paramNode.Kind != ast.KindIdent || paramNode.Data == 0 {
+				continue
+			}
+			paramName := p.Arena.Strings.String(token.StringID(paramNode.Data))
+			if paramName == "" || paramName == "_" || strings.HasPrefix(paramName, "__") {
+				continue
+			}
+			pTokIdx := int(paramNode.TokenIdx)
+			if pTokIdx < 0 || pTokIdx >= len(toks) {
+				continue
+			}
+			if id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				lamTy := chk.Types.Find(chk.NodeTypes[id])
+				if lamTy != types.NoType && int(lamTy) < len(chk.Types.Nodes) {
+					tNode := chk.Types.Nodes[lamTy]
+					if tNode.Kind == types.TyArrow {
+						paramTy := chk.Types.Find(types.TypeID(tNode.Left))
+						tyStr := chk.Types.Format(paramTy)
+						tk := toks[pTokIdx]
+						spanLen := int(tk.End - tk.Start)
+						if spanLen <= 0 {
+							spanLen = len(paramName)
+						}
+						pos := lspPosition{
+							Line:      max(0, int(tk.Line)-1),
+							Character: max(0, int(tk.Col)-1) + spanLen,
+						}
+						addHint(pos, ": "+tyStr)
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(hints, func(i, j int) bool {
+		if hints[i].Position.Line != hints[j].Position.Line {
+			return hints[i].Position.Line < hints[j].Position.Line
+		}
+		return hints[i].Position.Character < hints[j].Position.Character
+	})
+	return hints
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {
