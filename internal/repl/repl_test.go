@@ -293,6 +293,44 @@ func TestLSPInlayHints(t *testing.T) {
 	}
 }
 
+func TestLSPSemanticTokensAndWorkspaceSymbols(t *testing.T) {
+	doc1 := strings.Join([]string{
+		"type Status = Ready | Busy of int",
+		"let computeScore x = x + 42",
+	}, "\n") + "\n"
+	doc2 := "let globalMetric = 100\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///mod1.fml","text":%q}}}`, doc1),
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///mod2.fml","text":%q}}}`, doc2),
+		`{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"score"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"file:///mod1.fml"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"workspaceSymbolProvider":true`,
+		`"semanticTokensProvider"`,
+		`"name":"computeScore"`,
+		`"uri":"file:///mod1.fml"`,
+		`"data":[0,0,4,0,0,0,5,6,1,0`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in workspace/symbol or semanticTokens response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
 
 
 

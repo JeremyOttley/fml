@@ -113,6 +113,16 @@ type lspInlayHint struct {
 	PaddingLeft bool        `json:"paddingLeft,omitempty"`
 }
 
+type lspWorkspaceSymbol struct {
+	Name     string      `json:"name"`
+	Kind     int         `json:"kind"`
+	Location lspLocation `json:"location"`
+}
+
+type lspSemanticTokens struct {
+	Data []int `json:"data"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -199,6 +209,27 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"documentFormattingProvider": true,
 				"codeActionProvider":         true,
 				"inlayHintProvider":          true,
+				"workspaceSymbolProvider":    true,
+				"semanticTokensProvider": map[string]any{
+					"legend": map[string]any{
+						"tokenTypes": []string{
+							"keyword",
+							"type",
+							"enumMember",
+							"function",
+							"parameter",
+							"variable",
+							"number",
+							"string",
+							"operator",
+						},
+						"tokenModifiers": []string{
+							"declaration",
+							"readonly",
+						},
+					},
+					"full": true,
+				},
 				"signatureHelpProvider": map[string]any{
 					"triggerCharacters": []string{" ", "("},
 				},
@@ -380,6 +411,26 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			hints := s.computeInlayHints(params.TextDocument.URI, params.Range)
 			s.sendResponse(msg.ID, hints)
+		}
+
+	case "workspace/symbol":
+		var params struct {
+			Query string `json:"query"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			syms := s.computeWorkspaceSymbols(params.Query)
+			s.sendResponse(msg.ID, syms)
+		}
+
+	case "textDocument/semanticTokens/full":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			toks := s.computeSemanticTokens(params.TextDocument.URI)
+			s.sendResponse(msg.ID, toks)
 		}
 
 	case "shutdown":
@@ -1244,6 +1295,177 @@ func (s *LSPServer) computeInlayHints(uri string, rng lspRange) []lspInlayHint {
 		return hints[i].Position.Character < hints[j].Position.Character
 	})
 	return hints
+}
+
+func (s *LSPServer) computeWorkspaceSymbols(query string) []lspWorkspaceSymbol {
+	var uris []string
+	for uri := range s.Docs {
+		uris = append(uris, uri)
+	}
+	sort.Strings(uris)
+
+	qLower := strings.ToLower(strings.TrimSpace(query))
+	out := make([]lspWorkspaceSymbol, 0)
+	for _, uri := range uris {
+		docSyms := s.computeDocumentSymbols(uri)
+		for _, ds := range docSyms {
+			if qLower != "" && !strings.Contains(strings.ToLower(ds.Name), qLower) {
+				continue
+			}
+			out = append(out, lspWorkspaceSymbol{
+				Name: ds.Name,
+				Kind: ds.Kind,
+				Location: lspLocation{
+					URI:   uri,
+					Range: ds.SelectionRange,
+				},
+			})
+		}
+	}
+	return out
+}
+
+func (s *LSPServer) computeSemanticTokens(uri string) *lspSemanticTokens {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return &lspSemanticTokens{Data: []int{}}
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return &lspSemanticTokens{Data: []int{}}
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, _ = chk.Infer(root)
+
+	toks := p.Tokens()
+	src := p.Source()
+
+	typeSyms := make(map[token.StringID]bool)
+	for _, builtinTy := range []string{"int", "float", "string", "bool", "unit", "list", "array", "option", "Result", "Map", "Set", "Seq", "Async"} {
+		typeSyms[p.Arena.Strings.InternString(builtinTy)] = true
+	}
+	ctorSyms := make(map[token.StringID]bool)
+	for cID := range chk.Constructors {
+		ctorSyms[cID] = true
+	}
+	funcSyms := make(map[token.StringID]bool)
+	for symID, b := range chk.Scopes[0] {
+		ty := chk.Types.Find(b.Scheme.Body)
+		if ty != types.NoType && int(ty) < len(chk.Types.Nodes) && chk.Types.Nodes[ty].Kind == types.TyArrow {
+			funcSyms[symID] = true
+		}
+	}
+	paramSyms := make(map[token.StringID]bool)
+	paramTokIdxs := make(map[int]bool)
+	declTokIdxs := make(map[int]bool)
+
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		sym := token.StringID(n.Data)
+		switch n.Kind {
+		case ast.KindRecordType, ast.KindDUType, ast.KindMeasure, ast.KindTypeIdent:
+			if sym != token.NoString {
+				typeSyms[sym] = true
+			}
+		case ast.KindDUCase:
+			if sym != token.NoString {
+				ctorSyms[sym] = true
+			}
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			if sym != token.NoString {
+				name := p.Arena.Strings.String(sym)
+				startIdx := int(n.TokenIdx)
+				for i := startIdx; i < len(toks) && i <= startIdx+5; i++ {
+					if string(toks[i].Slice(src)) == name {
+						declTokIdxs[i] = true
+						break
+					}
+				}
+				if ast.NodeID(n.Left) != ast.NoNode && p.Arena.Get(ast.NodeID(n.Left)).Kind == ast.KindLambda {
+					funcSyms[sym] = true
+				}
+			}
+		case ast.KindLambda:
+			if sym != token.NoString {
+				paramSyms[sym] = true
+			}
+			if ast.NodeID(n.Left) != ast.NoNode {
+				pn := p.Arena.Get(ast.NodeID(n.Left))
+				if pn.Kind == ast.KindIdent {
+					paramTokIdxs[int(pn.TokenIdx)] = true
+					declTokIdxs[int(pn.TokenIdx)] = true
+				}
+			}
+		}
+	}
+
+	// Token type indices matching legend:
+	// 0: keyword, 1: type, 2: enumMember, 3: function, 4: parameter, 5: variable, 6: number, 7: string, 8: operator
+	var data []int
+	prevLine := 0
+	prevCol := 0
+
+	for i, tk := range toks {
+		if tk.Kind <= token.TokenSemi || tk.End <= tk.Start {
+			continue
+		}
+		tokType := -1
+		tokMod := 0
+
+		switch {
+		case tk.Kind == token.TokenInt || tk.Kind == token.TokenFloat:
+			tokType = 6
+		case tk.Kind == token.TokenString:
+			tokType = 7
+		case tk.Kind == token.TokenSome || tk.Kind == token.TokenNone || tk.Kind == token.TokenOk || tk.Kind == token.TokenError:
+			tokType = 2
+		case tk.Kind >= token.TokenTrue && tk.Kind <= token.TokenVal:
+			tokType = 0
+		case tk.Kind >= token.TokenAssign && tk.Kind <= token.TokenColonQMark:
+			tokType = 8
+		case tk.Kind == token.TokenIdent:
+			lexeme := string(tk.Slice(src))
+			sid := p.Arena.Strings.InternString(lexeme)
+			if declTokIdxs[i] {
+				tokMod |= 1 // declaration
+			}
+			switch {
+			case typeSyms[sid]:
+				tokType = 1
+			case ctorSyms[sid]:
+				tokType = 2
+			case paramTokIdxs[i] || paramSyms[sid]:
+				tokType = 4
+			case funcSyms[sid]:
+				tokType = 3
+			default:
+				tokType = 5
+			}
+		}
+
+		if tokType < 0 {
+			continue
+		}
+
+		line := max(0, int(tk.Line)-1)
+		col := max(0, int(tk.Col)-1)
+		length := int(tk.End - tk.Start)
+
+		deltaLine := line - prevLine
+		deltaCol := col
+		if deltaLine == 0 {
+			deltaCol = col - prevCol
+		}
+		data = append(data, deltaLine, deltaCol, length, tokType, tokMod)
+		prevLine = line
+		prevCol = col
+	}
+
+	if data == nil {
+		data = []int{}
+	}
+	return &lspSemanticTokens{Data: data}
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {
