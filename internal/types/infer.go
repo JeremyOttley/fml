@@ -273,6 +273,7 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Regex.findAll"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, listOf(TypeString)))}, false)
 	c.define(s.InternString("Regex.replace"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, arrow(TypeString, TypeString)))}, false)
 	c.define(s.InternString("Regex.split"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, listOf(TypeString)))}, false)
+	c.define(s.InternString("Regex.groups"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, optOf(listOf(TypeString))))}, false)
 
 	// Math combinators
 	c.define(s.InternString("Math.pi"), TypeScheme{Body: TypeFloat}, false)
@@ -291,8 +292,12 @@ func (c *Checker) registerCombinatorTypes() {
 	tStart, tCount := c.Types.AddExtra([]TypeID{a, TypeInt})
 	measuredPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: tStart, Right: tCount})
 	c.define(s.InternString("Time.nowUnixMs"), TypeScheme{Body: arrow(TypeUnit, TypeInt)}, false)
+	c.define(s.InternString("Time.nowMs"), TypeScheme{Body: arrow(TypeUnit, TypeInt)}, false)
+	c.define(s.InternString("Time.nowIso"), TypeScheme{Body: arrow(TypeUnit, TypeString)}, false)
 	c.define(s.InternString("Time.sleepMs"), TypeScheme{Body: arrow(TypeInt, TypeUnit)}, false)
 	c.define(s.InternString("Time.measureMs"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(TypeUnit, a), measuredPairTy)}, false)
+	c.define(s.InternString("Time.parseIso"), TypeScheme{Body: arrow(TypeString, resOf(TypeInt, TypeString))}, false)
+	c.define(s.InternString("Time.formatIso"), TypeScheme{Body: arrow(TypeInt, TypeString)}, false)
 
 	// Sys combinators
 	c.define(s.InternString("Sys.args"), TypeScheme{Body: arrow(TypeUnit, listOf(TypeString))}, false)

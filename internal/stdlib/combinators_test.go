@@ -177,6 +177,30 @@ else
 	}
 }
 
+func TestRegexGroupsAndTimeIsoCombinators(t *testing.T) {
+	src := `
+let grpOpt = Regex.groups "([a-z]+)-([0-9]+)" "release: ver-42!"
+let grps = Option.defaultValue [] grpOpt
+let noGrp = Regex.groups "([0-9]+)" "abc"
+
+let ms = Time.nowMs ()
+let nowIso = Time.nowIso ()
+let parsedMs = Time.parseIso "2025-01-01T00:00:00Z" |> Result.defaultValue 0
+let formatted = Time.formatIso parsedMs
+let badIso = Time.parseIso "not-a-timestamp"
+
+if (List.length grps == 2) && (List.head grps == "ver") && (Option.isNone noGrp) && (ms > 0) && (String.length nowIso >= 20) && (formatted == "2025-01-01T00:00:00Z") && (Result.isError badIso) then
+    parsedMs
+else
+    0
+`
+	val := evalFML(t, src)
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 1735689600000 {
+		t.Fatalf("expected 1735689600000 from Regex.groups and Time ISO operations, got %v", val)
+	}
+}
+
+
 
 
 

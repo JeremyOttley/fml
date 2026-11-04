@@ -749,12 +749,39 @@ func registerRegexModule(vm *runtime.VM) {
 		},
 	}
 
+	reGroups := &runtime.BuiltinVal{
+		Name:  "Regex.groups",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pat := runtime.Deref(args[0]).(runtime.StringVal).V
+			input := runtime.Deref(args[1]).(runtime.StringVal).V
+			re, err := compileCachedRegex(pat)
+			if err != nil {
+				return nil, err
+			}
+			sub := re.FindStringSubmatch(input)
+			if sub == nil {
+				return runtime.ADTVal{Tag: noneID, TagName: "None"}, nil
+			}
+			vals := make([]runtime.Value, 0, max(0, len(sub)-1))
+			for i := 1; i < len(sub); i++ {
+				vals = append(vals, runtime.StringVal{V: sub[i]})
+			}
+			return runtime.ADTVal{
+				Tag:     someID,
+				TagName: "Some",
+				Payload: runtime.SliceToList(vals),
+			}, nil
+		},
+	}
+
 	defineModuleRecord(vm, "Regex", map[string]runtime.Value{
 		"isMatch": reIsMatch,
 		"find":    reFind,
 		"findAll": reFindAll,
 		"replace": reReplace,
 		"split":   reSplit,
+		"groups":  reGroups,
 	})
 }
 
@@ -886,11 +913,30 @@ func registerMathModule(vm *runtime.VM) {
 }
 
 func registerTimeModule(vm *runtime.VM) {
+	okTag := vm.Prog.Strings.InternString("Ok")
+	errTag := vm.Prog.Strings.InternString("Error")
+
 	timeNowUnixMs := &runtime.BuiltinVal{
 		Name:  "Time.nowUnixMs",
 		Arity: 1,
 		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
 			return runtime.IntVal{V: time.Now().UnixMilli()}, nil
+		},
+	}
+
+	timeNowMs := &runtime.BuiltinVal{
+		Name:  "Time.nowMs",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
+			return runtime.IntVal{V: time.Now().UnixMilli()}, nil
+		},
+	}
+
+	timeNowIso := &runtime.BuiltinVal{
+		Name:  "Time.nowIso",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, _ []runtime.Value) (runtime.Value, error) {
+			return runtime.StringVal{V: time.Now().UTC().Format(time.RFC3339)}, nil
 		},
 	}
 
@@ -920,10 +966,53 @@ func registerTimeModule(vm *runtime.VM) {
 		},
 	}
 
+	timeParseIso := &runtime.BuiltinVal{
+		Name:  "Time.parseIso",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			sv, ok := runtime.Deref(args[0]).(runtime.StringVal)
+			if !ok {
+				return nil, fmt.Errorf("Time.parseIso expects string")
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, sv.V)
+			if err != nil {
+				parsed, err = time.Parse(time.RFC3339, sv.V)
+			}
+			if err != nil {
+				return runtime.ADTVal{
+					Tag:     errTag,
+					TagName: "Error",
+					Payload: runtime.StringVal{V: err.Error()},
+				}, nil
+			}
+			return runtime.ADTVal{
+				Tag:     okTag,
+				TagName: "Ok",
+				Payload: runtime.IntVal{V: parsed.UnixMilli()},
+			}, nil
+		},
+	}
+
+	timeFormatIso := &runtime.BuiltinVal{
+		Name:  "Time.formatIso",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			iv, ok := runtime.Deref(args[0]).(runtime.IntVal)
+			if !ok {
+				return nil, fmt.Errorf("Time.formatIso expects int milliseconds")
+			}
+			return runtime.StringVal{V: time.UnixMilli(iv.V).UTC().Format(time.RFC3339)}, nil
+		},
+	}
+
 	defineModuleRecord(vm, "Time", map[string]runtime.Value{
 		"nowUnixMs": timeNowUnixMs,
+		"nowMs":     timeNowMs,
+		"nowIso":    timeNowIso,
 		"sleepMs":   timeSleepMs,
 		"measureMs": timeMeasureMs,
+		"parseIso":  timeParseIso,
+		"formatIso": timeFormatIso,
 	})
 }
 

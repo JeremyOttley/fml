@@ -325,9 +325,9 @@ First-class code quotations `<@ expr @>` reify FML expressions into the built-in
 | `String` | `String.length`, `String.trim`, `String.split`, `String.join`, `String.contains`, `String.toUpper`, `String.toLower` |
 | `Option` | `Option.isSome`, `Option.isNone`, `Option.defaultValue`, `Option.map`, `Option.bind` |
 | `Result` | `Result.isOk`, `Result.isError`, `Result.defaultValue`, `Result.map`, `Result.mapError`, `Result.bind` |
-| `Regex` | `Regex.isMatch`, `Regex.find`, `Regex.findAll`, `Regex.replace`, `Regex.split` |
+| `Regex` | `Regex.isMatch`, `Regex.find`, `Regex.findAll`, `Regex.replace`, `Regex.split`, `Regex.groups` |
 | `Math` | `Math.pi`, `Math.abs`, `Math.min`, `Math.max`, `Math.sqrt`, `Math.pow`, `Math.sin`, `Math.cos`, `Math.floor`, `Math.ceil`, `Math.round` |
-| `Time` | `Time.nowUnixMs`, `Time.sleepMs`, `Time.measureMs` |
+| `Time` | `Time.nowUnixMs`, `Time.nowMs`, `Time.nowIso`, `Time.sleepMs`, `Time.measureMs`, `Time.parseIso`, `Time.formatIso` |
 | `Sys` | `Sys.args`, `Sys.getenv`, `Sys.setenv`, `Sys.cwd`, `Sys.fileExists` |
 | `Crypto` | `Crypto.sha256`, `Crypto.hmacSha256`, `Crypto.base64Encode`, `Crypto.base64Decode`, `Crypto.uuid4` |
 | `Test` | `Test.assert`, `Test.assertEq`, `Test.forall` (QuickCheck-style property verification) |
