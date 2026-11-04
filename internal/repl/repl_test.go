@@ -181,4 +181,37 @@ func TestLSPCompletionAndReferences(t *testing.T) {
 	}
 }
 
+func TestLSPRenameAndFormatting(t *testing.T) {
+	doc := "let   oldVal   =   10 + 20\nlet res = oldVal * 2\n"
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///refactor.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///refactor.fml"},"position":{"line":1,"character":11},"newName":"newVal"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///refactor.fml"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	if !strings.Contains(resp, `"renameProvider":true`) || !strings.Contains(resp, `"documentFormattingProvider":true`) {
+		t.Fatalf("expected renameProvider and documentFormattingProvider in capabilities, got:\n%s", resp)
+	}
+	// Verify rename produces WorkspaceEdit replacing both occurrences of oldVal with newVal
+	if !strings.Contains(resp, `"newText":"newVal"`) ||
+		!strings.Contains(resp, `"start":{"line":0,"character":6}`) ||
+		!strings.Contains(resp, `"start":{"line":1,"character":10}`) {
+		t.Fatalf("expected rename WorkspaceEdit for both occurrences of oldVal, got:\n%s", resp)
+	}
+	// Verify formatting normalizes extra spaces via Wadler layout engine
+	if !strings.Contains(resp, `let oldVal = 10 + 20\nlet res = oldVal * 2\n`) {
+		t.Fatalf("expected formatted document text in textDocument/formatting response, got:\n%s", resp)
+	}
+}
+
+
 

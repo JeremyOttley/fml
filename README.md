@@ -192,9 +192,9 @@ let ans  = Quote.eval expr        // 42
 ./fml fmt program.fml
 
 # Run all *_test.fml unit & property test suites in a directory
-./fml test .
+./fml test examples
 
-# Start the JSON-RPC 2.0 Language Server Protocol (hover & real-time diagnostics)
+# Start the JSON-RPC 2.0 Language Server Protocol (hover, definition, symbols, completion, references, rename, formatting & diagnostics)
 ./fml lsp
 
 # Launch the interactive REPL (:type, :ir, :quote, :fmt, :help)
@@ -215,7 +215,7 @@ go test -race -v ./...
 Run zero-allocation lexer and string interner benchmarks:
 
 ```bash
-go test -bench=. -benchmem ./internal/token ./internal/lexer
+go test -bench=. -benchmem ./internal/token ./internal/lexer ./cmd/fml
 ```
 
 ---
@@ -224,18 +224,19 @@ go test -bench=. -benchmem ./internal/token ./internal/lexer
 
 ```text
 .
-├── cmd/fml/                 # Standalone CLI entry point (`fml run`, `fml build`, `fml emit-go`, `fml check`, `fml repl`)
+├── cmd/fml/                 # Standalone CLI entry point (`fml run`, `fml build`, `fml emit-go`, `fml check`, `fml fmt`, `fml test`, `fml lsp`, `fml repl`)
+├── examples/                # End-to-end FML example programs, schemas, and `core_suite_test.fml` test suite
 ├── internal/
 │   ├── token/               # 16-byte Token definitions and contiguous []byte StringTable interner
 │   ├── ast/                 # 24-byte indexed AST Node and flat Arena allocator
 │   ├── lexer/               # Zero-allocation state-machine lexer and off-side indentation stack
 │   ├── parser/              # Recursive descent, Pratt expression parser & multi-file module loader
-│   ├── types/               # Union-Find TypeArena, Algorithm W, Units of Measure, Functors, JsonProvider, Diagnostics
-│   ├── ir/                  # 10-opcode flat IR, AST lowering, IRSwitch decision trees, closure conversion
-│   ├── codegen/             # Ahead-of-Time (AOT) Go jump-table emitter, disassembler, and binary builder
-│   ├── repl/                # Interactive REPL session, :type/:ir/:quote inspectors, and static file checker
+│   ├── types/               # Union-Find TypeArena, Algorithm W, Units of Measure, Functors, TypeProviders, Diagnostics
+│   ├── ir/                  # 10-opcode flat IR, AST lowering, IRSwitch decision trees, optimizer & closure conversion
+│   ├── codegen/             # Ahead-of-Time (AOT) Go jump-table emitter, unboxed scalar specializer & binary builder
+│   ├── repl/                # Interactive REPL session, :type/:ir/:quote/:fmt inspectors, LSP server & file checker
 │   ├── runtime/             # Closed Value sum-type interface and tail-call-optimized VM
-│   └── stdlib/              # Map, Set, List, Array, String, Option, Result, Seq, Format, Mailbox, Async, File, Json, Http, Quote
+│   └── stdlib/              # Map, Set, List, Array, String, Option, Result, Seq, Format, Mailbox, Async, File, Json, Http, Quote, Regex, Math, Time, Test
 ├── STDLIB.md                # User-facing Standard Library Reference Manual
 ├── f_language_elements.md   # F# Core Language Elements Reference
 ├── PLAN.md                  # BABOK Requirements Synthesis & PMBOK Work Breakdown Structure

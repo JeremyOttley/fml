@@ -75,6 +75,15 @@ type lspCompletionItem struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+type lspTextEdit struct {
+	Range   lspRange `json:"range"`
+	NewText string   `json:"newText"`
+}
+
+type lspWorkspaceEdit struct {
+	Changes map[string][]lspTextEdit `json:"changes"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -152,11 +161,13 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 	case "initialize":
 		s.sendResponse(msg.ID, map[string]any{
 			"capabilities": map[string]any{
-				"textDocumentSync":       1,
-				"hoverProvider":          true,
-				"definitionProvider":     true,
-				"documentSymbolProvider": true,
-				"referencesProvider":     true,
+				"textDocumentSync":           1,
+				"hoverProvider":              true,
+				"definitionProvider":         true,
+				"documentSymbolProvider":     true,
+				"referencesProvider":         true,
+				"renameProvider":             true,
+				"documentFormattingProvider": true,
 				"completionProvider": map[string]any{
 					"triggerCharacters": []string{"."},
 				},
@@ -267,6 +278,34 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			locs := s.computeReferences(params.TextDocument.URI, params.Position)
 			s.sendResponse(msg.ID, locs)
+		}
+
+	case "textDocument/rename":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+			NewName  string      `json:"newName"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			edit := s.computeRename(params.TextDocument.URI, params.Position, params.NewName)
+			if edit == nil {
+				s.sendResponse(msg.ID, nil)
+			} else {
+				s.sendResponse(msg.ID, edit)
+			}
+		}
+
+	case "textDocument/formatting":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			edits := s.computeFormatting(params.TextDocument.URI)
+			s.sendResponse(msg.ID, edits)
 		}
 
 	case "shutdown":
@@ -720,6 +759,58 @@ func (s *LSPServer) computeReferences(uri string, pos lspPosition) []lspLocation
 		})
 	}
 	return locs
+}
+
+func (s *LSPServer) computeRename(uri string, pos lspPosition, newName string) *lspWorkspaceEdit {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return nil
+	}
+	locs := s.computeReferences(uri, pos)
+	if len(locs) == 0 {
+		return nil
+	}
+	edits := make([]lspTextEdit, len(locs))
+	for i, loc := range locs {
+		edits[i] = lspTextEdit{
+			Range:   loc.Range,
+			NewText: newName,
+		}
+	}
+	return &lspWorkspaceEdit{
+		Changes: map[string][]lspTextEdit{
+			uri: edits,
+		},
+	}
+}
+
+func (s *LSPServer) computeFormatting(uri string) []lspTextEdit {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	formatted, err := FormatSource([]byte(text), 80)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	endLine := len(lines) - 1
+	if endLine < 0 {
+		endLine = 0
+	}
+	endChar := 0
+	if len(lines) > 0 {
+		endChar = len(lines[len(lines)-1])
+	}
+	return []lspTextEdit{
+		{
+			Range: lspRange{
+				Start: lspPosition{Line: 0, Character: 0},
+				End:   lspPosition{Line: endLine, Character: endChar},
+			},
+			NewText: formatted,
+		},
+	}
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {
