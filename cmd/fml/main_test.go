@@ -412,5 +412,50 @@ func BenchmarkExecutePhysicsUnitsExample(b *testing.B) {
 	}
 }
 
+func TestCLIFmtWriteRecursiveTestAndDoc(t *testing.T) {
+	tmpDir := t.TempDir()
+	nestedDir := filepath.Join(tmpDir, "sub", "pkg")
+	if err := os.MkdirAll(nestedDir, 0755); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+
+	unformattedPath := filepath.Join(nestedDir, "math_test.fml")
+	unformattedSrc := "let   x   =   10   +   32\nTest.assertEq \"forty-two\" 42 x\n"
+	if err := os.WriteFile(unformattedPath, []byte(unformattedSrc), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var fmtOut bytes.Buffer
+	if err := runFmt([]string{"-w", tmpDir}, &fmtOut); err != nil {
+		t.Fatalf("runFmt -w failed: %v", err)
+	}
+	formattedBytes, err := os.ReadFile(unformattedPath)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if !strings.Contains(string(formattedBytes), "let x = 10 + 32\n") {
+		t.Fatalf("expected in-place formatted file to normalize spacing, got:\n%s", string(formattedBytes))
+	}
+
+	var testOut bytes.Buffer
+	if err := runTestSuite(tmpDir+"/...", &testOut); err != nil {
+		t.Fatalf("recursive runTestSuite failed: %v", err)
+	}
+	if !strings.Contains(testOut.String(), "PASS") || !strings.Contains(testOut.String(), "ok\t1 test file(s) passed") {
+		t.Fatalf("expected recursive PASS and summary line, got:\n%s", testOut.String())
+	}
+
+	var docOut bytes.Buffer
+	if err := runDoc("Time", &docOut); err != nil {
+		t.Fatalf("runDoc(Time) failed: %v", err)
+	}
+	for _, want := range []string{"val Time.nowMs :", "val Time.nowIso :", "val Time.parseIso :", "val Time.formatIso :"} {
+		if !strings.Contains(docOut.String(), want) {
+			t.Fatalf("expected %q in runDoc(Time) output, got:\n%s", want, docOut.String())
+		}
+	}
+}
+
+
 
 

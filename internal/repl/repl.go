@@ -427,6 +427,10 @@ func astToDoc(arena *ast.Arena, id ast.NodeID) *stdlib.Doc {
 		}
 		return dSeq(dText("{ "), dSeq(parts...), dText(" }"))
 
+	case ast.KindFieldAccess:
+		recvDoc := astToDoc(arena, ast.NodeID(n.Left))
+		return dSeq(recvDoc, dText("."+s.String(token.StringID(n.Data))))
+
 	default:
 		return dText(s.String(token.StringID(n.Data)))
 	}
