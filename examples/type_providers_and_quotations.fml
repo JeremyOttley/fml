@@ -1,0 +1,40 @@
+// Example 3: Compile-Time Type Providers, SML Parametric Functors & AST Quotations
+type ServiceConfig = JsonProvider<"service.json">
+type NodeMetrics   = CsvProvider<"metrics.csv">
+type ClusterEnv    = EnvProvider<".env">
+
+module IntEq =
+    let eq a b = a == b
+
+module MakeAuditor (Eq: COMPARABLE) =
+    let verify target actual = Eq.eq target actual
+
+module IntAuditor = MakeAuditor(IntEq)
+
+let cfg  = ServiceConfig.Sample
+let rows = NodeMetrics.Sample
+let env  = ClusterEnv.Sample
+
+let totalRequests =
+    rows
+    |> List.map (fun r -> r.requests)
+    |> List.sum
+
+let validateRequests n =
+    if IntAuditor.verify 450 n then Ok n else Error "request_mismatch"
+
+let auditResult = result {
+    let! verifiedReqs = validateRequests totalRequests
+    return verifiedReqs + cfg.workers + env.BASE_OFFSET
+}
+
+let formula = <@ 20 + 22 @>
+let quotedVal = Quote.eval formula
+
+let total =
+    match auditResult with
+    | Ok v -> v + quotedVal
+    | Error _ -> 0
+
+printfn (Quote.toString formula)
+total

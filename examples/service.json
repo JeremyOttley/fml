@@ -1,0 +1,6 @@
+{
+  "service": "telemetry-gateway",
+  "port": 8080,
+  "workers": 4,
+  "tls": true
+}

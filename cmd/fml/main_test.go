@@ -367,4 +367,50 @@ Test.forall "all latencies positive" rows (fun r -> r.latency > 0)
 	}
 }
 
+func TestExamplesSuiteAndRunner(t *testing.T) {
+	examplesDir := filepath.Join("..", "..", "examples")
+	cases := []struct {
+		file string
+		want int64
+	}{
+		{file: "physics_units.fml", want: 500},
+		{file: "actor_pipeline.fml", want: 430},
+		{file: "type_providers_and_quotations.fml", want: 546},
+	}
+
+	for _, tc := range cases {
+		var out bytes.Buffer
+		path := filepath.Join(examplesDir, tc.file)
+		val, err := ExecuteFile(path, &out)
+		if err != nil {
+			t.Fatalf("ExecuteFile(%s) failed: %v", tc.file, err)
+		}
+		iv, ok := val.(runtime.IntVal)
+		if !ok || iv.V != tc.want {
+			t.Fatalf("%s: expected IntVal(%d), got %v", tc.file, tc.want, val)
+		}
+	}
+
+	var suiteOut bytes.Buffer
+	if err := runTestSuite(examplesDir, &suiteOut); err != nil {
+		t.Fatalf("runTestSuite(examples) failed: %v\noutput: %s", err, suiteOut.String())
+	}
+	if !strings.Contains(suiteOut.String(), "PASS") {
+		t.Fatalf("expected PASS in examples test suite output, got %q", suiteOut.String())
+	}
+}
+
+func BenchmarkExecutePhysicsUnitsExample(b *testing.B) {
+	path := filepath.Join("..", "..", "examples", "physics_units.fml")
+	var sink bytes.Buffer
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sink.Reset()
+		if _, err := ExecuteFile(path, &sink); err != nil {
+			b.Fatalf("ExecuteFile failed: %v", err)
+		}
+	}
+}
+
+
 

@@ -1,0 +1,38 @@
+// Example 2: MailboxProcessor Actor Pipeline, Persistent AVL Collections & Async
+type Command = Deposit of int | Withdraw of int
+
+let applyCmd bal cmd =
+    match cmd with
+    | Deposit amt -> bal + amt
+    | Withdraw amt -> bal - amt
+
+let ledger =
+    [Deposit 200; Withdraw 45; Deposit 95; Withdraw 50]
+    |> List.fold applyCmd 100
+
+let store0 = Map.empty
+let store1 = Map.add "opening" 100 store0
+let store2 = Map.add "closing" ledger store1
+
+let tags =
+    Set.ofList ["verified"; "immutable"; "verified"; "avl"]
+
+let worker = Mailbox.Start (fun inbox ->
+    let req = Mailbox.Receive inbox
+    let v = fst req
+    let reply = snd req
+    reply (v + (Set.count tags) * 10)
+)
+
+let parSums =
+    Async.RunSynchronously (
+        Async.Parallel [
+            async { return Map.find "opening" store2 };
+            async { return Map.find "closing" store2 }
+        ]
+    )
+
+let combined = List.sum parSums
+let finalTotal = Mailbox.PostAndAsyncReply worker combined
+printfn finalTotal
+finalTotal

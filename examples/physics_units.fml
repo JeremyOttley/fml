@@ -1,0 +1,34 @@
+// Example 1: Zero-Overhead Units of Measure, Active Patterns & Wadler Pretty-Printing
+[<Measure>] type kg
+[<Measure>] type m
+[<Measure>] type s
+
+let (|Even|Odd|) n = if n % 2 == 0 then Even else Odd
+
+let momentum (mass: float<kg>) (vel: float<m/s>) =
+    mass * vel
+
+let kineticEnergy (mass: float<kg>) (vel: float<m/s>) =
+    0.5 * mass * (vel * vel)
+
+let p = momentum 12.0<kg> 15.0<m/s>
+let ke = kineticEnergy 12.0<kg> 15.0<m/s>
+
+let evenHarmonicsSum =
+    Seq.init 8 (fun i -> i + 1)
+    |> Seq.filter (fun n ->
+        match n with
+        | Even -> true
+        | Odd -> false)
+    |> Seq.map (fun n -> n * 25)
+    |> Seq.sum
+
+let report =
+    Format.group (
+        Format.concat
+            (Format.text "Momentum(kg*m/s)=180")
+            (Format.concat Format.line (Format.text "KineticEnergy(J)=1350"))
+    )
+
+printfn (Format.pretty 80 report)
+evenHarmonicsSum

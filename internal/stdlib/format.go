@@ -219,6 +219,7 @@ func RegisterFormat(vm *runtime.VM) {
 		"doc":    docText,
 		"text":   docText,
 		"cat":    docCat,
+		"concat": docCat,
 		"nest":   docNest,
 		"group":  docGroup,
 		"pretty": docPretty,

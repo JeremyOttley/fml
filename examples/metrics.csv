@@ -1,0 +1,4 @@
+node,requests,errors,healthy
+edge-1,120,2,true
+edge-2,180,0,true
+edge-3,150,1,true
