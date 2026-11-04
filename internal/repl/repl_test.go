@@ -213,5 +213,45 @@ func TestLSPRenameAndFormatting(t *testing.T) {
 	}
 }
 
+func TestLSPSignatureHelpAndExhaustivenessCodeAction(t *testing.T) {
+	doc := strings.Join([]string{
+		"type Shape = Circle of int | Rect of int * int | Point",
+		"let add3 (x: int) (y: int) (z: int) = x + y + z",
+		"let call = add3 10 20 ",
+		"let area s =",
+		"    match s with",
+		"    | Circle r -> r * r",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///actions.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":"file:///actions.fml"},"position":{"line":2,"character":22}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///actions.fml"},"range":{"start":{"line":4,"character":4},"end":{"line":5,"character":20}}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	if !strings.Contains(resp, `"signatureHelpProvider"`) || !strings.Contains(resp, `"codeActionProvider":true`) {
+		t.Fatalf("expected signatureHelpProvider and codeActionProvider in capabilities, got:\n%s", resp)
+	}
+	// On line 2 ("let call = add3 10 20 "), 2 arguments are already provided so activeParameter is 2 (the 3rd parameter)
+	if !strings.Contains(resp, `"label":"add3 : (int -> (int -> (int -> int)))"`) || !strings.Contains(resp, `"activeParameter":2`) {
+		t.Fatalf("expected signatureHelp for add3 with activeParameter 2, got:\n%s", resp)
+	}
+	// Exhaustiveness quick-fix should synthesize missing Point and Rect _ arms
+	if !strings.Contains(resp, `"title":"Add missing match case(s): Point, Rect _"`) ||
+		!strings.Contains(resp, `| Point -> 0\n    | Rect _ -> 0\n`) {
+		t.Fatalf("expected quickfix codeAction adding Point and Rect _ match cases, got:\n%s", resp)
+	}
+}
+
+
 
 

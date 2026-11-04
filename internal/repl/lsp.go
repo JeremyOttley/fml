@@ -84,6 +84,28 @@ type lspWorkspaceEdit struct {
 	Changes map[string][]lspTextEdit `json:"changes"`
 }
 
+type lspParameterInformation struct {
+	Label string `json:"label"`
+}
+
+type lspSignatureInformation struct {
+	Label           string                    `json:"label"`
+	Parameters      []lspParameterInformation `json:"parameters,omitempty"`
+	ActiveParameter int                       `json:"activeParameter"`
+}
+
+type lspSignatureHelp struct {
+	Signatures      []lspSignatureInformation `json:"signatures"`
+	ActiveSignature int                       `json:"activeSignature"`
+	ActiveParameter int                       `json:"activeParameter"`
+}
+
+type lspCodeAction struct {
+	Title string            `json:"title"`
+	Kind  string            `json:"kind"`
+	Edit  *lspWorkspaceEdit `json:"edit,omitempty"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -168,6 +190,10 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"referencesProvider":         true,
 				"renameProvider":             true,
 				"documentFormattingProvider": true,
+				"codeActionProvider":         true,
+				"signatureHelpProvider": map[string]any{
+					"triggerCharacters": []string{" ", "("},
+				},
 				"completionProvider": map[string]any{
 					"triggerCharacters": []string{"."},
 				},
@@ -306,6 +332,34 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			edits := s.computeFormatting(params.TextDocument.URI)
 			s.sendResponse(msg.ID, edits)
+		}
+
+	case "textDocument/signatureHelp":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			sigHelp := s.computeSignatureHelp(params.TextDocument.URI, params.Position)
+			if sigHelp == nil {
+				s.sendResponse(msg.ID, nil)
+			} else {
+				s.sendResponse(msg.ID, sigHelp)
+			}
+		}
+
+	case "textDocument/codeAction":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Range lspRange `json:"range"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			actions := s.computeCodeActions(params.TextDocument.URI, params.Range)
+			s.sendResponse(msg.ID, actions)
 		}
 
 	case "shutdown":
@@ -809,6 +863,238 @@ func (s *LSPServer) computeFormatting(uri string) []lspTextEdit {
 				End:   lspPosition{Line: endLine, Character: endChar},
 			},
 			NewText: formatted,
+		},
+	}
+}
+
+func (s *LSPServer) computeSignatureHelp(uri string, pos lspPosition) *lspSignatureHelp {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if pos.Line < 0 || pos.Line >= len(lines) {
+		return nil
+	}
+	line := lines[pos.Line]
+	col := pos.Character
+	if col > len(line) {
+		col = len(line)
+	}
+	if col < 0 {
+		col = 0
+	}
+	prefix := line[:col]
+	if eqIdx := strings.LastIndex(prefix, "="); eqIdx >= 0 && (eqIdx == 0 || prefix[eqIdx-1] != '=') {
+		prefix = prefix[eqIdx+1:]
+	}
+	if pipeIdx := strings.LastIndex(prefix, "|>"); pipeIdx >= 0 {
+		prefix = prefix[pipeIdx+2:]
+	}
+
+	tokens := splitCallTokens(prefix)
+	if len(tokens) == 0 {
+		return nil
+	}
+	fnName := tokens[0]
+	activeParam := len(tokens) - 1
+	if len(prefix) > 0 && prefix[len(prefix)-1] != ' ' && prefix[len(prefix)-1] != '\t' && len(tokens) > 1 {
+		activeParam = len(tokens) - 2
+	}
+	if activeParam < 0 {
+		activeParam = 0
+	}
+
+	arena := ast.NewArena(64, 64, nil)
+	chk := types.NewChecker(arena, nil)
+
+	// Also attempt to type-check preceding lines or full document so user-defined functions resolve
+	priorText := strings.Join(lines[:pos.Line], "\n") + "\n"
+	if p, root, err := parser.ParseSource([]byte(text), nil); err == nil {
+		docChk := types.NewChecker(p.Arena, nil)
+		_, _ = docChk.Infer(root)
+		arena = p.Arena
+		chk = docChk
+	} else if p2, root2, err2 := parser.ParseSource([]byte(priorText), nil); err2 == nil {
+		docChk := types.NewChecker(p2.Arena, nil)
+		_, _ = docChk.Infer(root2)
+		arena = p2.Arena
+		chk = docChk
+	}
+
+	symID := arena.Strings.InternString(fnName)
+	b, found := chk.Scopes[0][symID]
+	if !found {
+		return nil
+	}
+	ty := chk.Types.Find(b.Scheme.Body)
+	var params []lspParameterInformation
+	curr := ty
+	for int(curr) < len(chk.Types.Nodes) && chk.Types.Nodes[curr].Kind == types.TyArrow {
+		n := chk.Types.Nodes[curr]
+		paramTy := chk.Types.Format(types.TypeID(n.Left))
+		params = append(params, lspParameterInformation{Label: paramTy})
+		curr = chk.Types.Find(types.TypeID(n.Right))
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	if activeParam >= len(params) {
+		activeParam = len(params) - 1
+	}
+	sigInfo := lspSignatureInformation{
+		Label:           fmt.Sprintf("%s : %s", fnName, chk.Types.Format(ty)),
+		Parameters:      params,
+		ActiveParameter: activeParam,
+	}
+	return &lspSignatureHelp{
+		Signatures:      []lspSignatureInformation{sigInfo},
+		ActiveSignature: 0,
+		ActiveParameter: activeParam,
+	}
+}
+
+func splitCallTokens(s string) []string {
+	var out []string
+	var cur strings.Builder
+	depth := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '"' && (i == 0 || s[i-1] != '\\') {
+			inStr = !inStr
+			cur.WriteByte(ch)
+			continue
+		}
+		if inStr {
+			cur.WriteByte(ch)
+			continue
+		}
+		if ch == '(' || ch == '[' || ch == '{' {
+			depth++
+			cur.WriteByte(ch)
+			continue
+		}
+		if ch == ')' || ch == ']' || ch == '}' {
+			if depth > 0 {
+				depth--
+			}
+			cur.WriteByte(ch)
+			continue
+		}
+		if (ch == ' ' || ch == '\t') && depth == 0 {
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+var missingADTRe = regexp.MustCompile(`missing constructor\(s\) \[([^\]]+)\]`)
+
+func (s *LSPServer) computeCodeActions(uri string, _ lspRange) []lspCodeAction {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return nil
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, err = chk.Infer(root)
+	if err == nil || !strings.Contains(err.Error(), "non-exhaustive") {
+		return nil
+	}
+
+	errMsg := err.Error()
+	var missingPats []string
+
+	if m := missingADTRe.FindStringSubmatch(errMsg); len(m) == 2 {
+		names := strings.Fields(m[1])
+		sort.Strings(names)
+		for _, ctorName := range names {
+			cID := p.Arena.Strings.InternString(ctorName)
+			if info, hasCtor := chk.Constructors[cID]; hasCtor && info.Payload != types.NoType {
+				missingPats = append(missingPats, ctorName+" _")
+			} else {
+				missingPats = append(missingPats, ctorName)
+			}
+		}
+	} else if strings.Contains(errMsg, "non-exhaustive option match") {
+		if !strings.Contains(text, "| None") {
+			missingPats = append(missingPats, "None")
+		} else {
+			missingPats = append(missingPats, "Some _")
+		}
+	} else if strings.Contains(errMsg, "non-exhaustive Result match") {
+		if !strings.Contains(text, "| Error") {
+			missingPats = append(missingPats, "Error _")
+		} else {
+			missingPats = append(missingPats, "Ok _")
+		}
+	} else if strings.Contains(errMsg, "non-exhaustive boolean match") {
+		if !strings.Contains(text, "| false") {
+			missingPats = append(missingPats, "false")
+		} else {
+			missingPats = append(missingPats, "true")
+		}
+	} else {
+		missingPats = append(missingPats, "_")
+	}
+
+	lines := strings.Split(text, "\n")
+	insertLine := len(lines) - 1
+	indent := "    "
+	rhsDefault := "0"
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "|") {
+			insertLine = i + 1
+			leadLen := len(lines[i]) - len(strings.TrimLeft(lines[i], " \t"))
+			indent = lines[i][:leadLen]
+			if arrowIdx := strings.Index(trimmed, "->"); arrowIdx >= 0 {
+				rhsSample := strings.TrimSpace(trimmed[arrowIdx+2:])
+				if strings.HasPrefix(rhsSample, "\"") {
+					rhsDefault = "\"\""
+				} else if rhsSample == "true" || rhsSample == "false" {
+					rhsDefault = "false"
+				} else if strings.Contains(rhsSample, ".") {
+					rhsDefault = "0.0"
+				}
+			}
+			break
+		}
+	}
+
+	var stub strings.Builder
+	for _, pat := range missingPats {
+		fmt.Fprintf(&stub, "%s| %s -> %s\n", indent, pat, rhsDefault)
+	}
+
+	pos := lspPosition{Line: insertLine, Character: 0}
+	return []lspCodeAction{
+		{
+			Title: fmt.Sprintf("Add missing match case(s): %s", strings.Join(missingPats, ", ")),
+			Kind:  "quickfix",
+			Edit: &lspWorkspaceEdit{
+				Changes: map[string][]lspTextEdit{
+					uri: {
+						{
+							Range:   lspRange{Start: pos, End: pos},
+							NewText: stub.String(),
+						},
+					},
+				},
+			},
 		},
 	}
 }
