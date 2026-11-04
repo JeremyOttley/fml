@@ -307,4 +307,62 @@ printfn (fib10 + accum)
 	}
 }
 
+func TestAOTNativeGoFunctionSynthesis(t *testing.T) {
+	src := `
+let rec fib (n: int) =
+    if n <= 1 then n
+    else fib (n - 1) + fib (n - 2)
+
+let hypotenuseSq (a: float) (b: float) =
+    (a * a) + (b * b)
+
+let f20 = fib 20
+let h = hypotenuseSq 3.0 4.0
+printfn h
+printfn f20
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_fn.fml")
+	binPath := filepath.Join(tmpDir, "native_fn_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for fib",
+		"// Native unboxed Go function for hypotenuseSq",
+		"func aotFn_",
+		"(p_0 int64) int64",
+		"(p_0 float64, p_1 float64) float64",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 || strings.TrimSpace(lines[0]) != "25" || strings.TrimSpace(lines[1]) != "6765" {
+		t.Fatalf("expected output lines ['25', '6765'], got %v", lines)
+	}
+}
+
+
 
