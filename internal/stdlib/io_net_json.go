@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"fml/internal/runtime"
 	"fml/internal/token"
@@ -113,6 +115,9 @@ func RegisterIONetJSON(vm *runtime.VM) {
 		},
 	}
 
+	okTag := vm.Prog.Strings.InternString("Ok")
+	errTag := vm.Prog.Strings.InternString("Error")
+
 	jsonDecode := &runtime.BuiltinVal{
 		Name:  "Json.decode",
 		Arity: 1,
@@ -128,9 +133,36 @@ func RegisterIONetJSON(vm *runtime.VM) {
 		},
 	}
 
+	jsonTryDecode := &runtime.BuiltinVal{
+		Name:  "Json.tryDecode",
+		Arity: 1,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			sv, ok := runtime.Deref(args[0]).(runtime.StringVal)
+			if !ok {
+				return nil, fmt.Errorf("Json.tryDecode expects string")
+			}
+			dec := json.NewDecoder(strings.NewReader(sv.V))
+			dec.UseNumber()
+			var raw any
+			if err := dec.Decode(&raw); err != nil {
+				return runtime.ADTVal{
+					Tag:     errTag,
+					TagName: "Error",
+					Payload: runtime.StringVal{V: err.Error()},
+				}, nil
+			}
+			return runtime.ADTVal{
+				Tag:     okTag,
+				TagName: "Ok",
+				Payload: goJSONToFMLValue(v.Prog.Strings, raw),
+			}, nil
+		},
+	}
+
 	defineModuleRecord(vm, "Json", map[string]runtime.Value{
-		"encode": jsonEncode,
-		"decode": jsonDecode,
+		"encode":    jsonEncode,
+		"decode":    jsonDecode,
+		"tryDecode": jsonTryDecode,
 	})
 
 	httpGet := &runtime.BuiltinVal{
@@ -148,6 +180,43 @@ func RegisterIONetJSON(vm *runtime.VM) {
 				return nil, fmt.Errorf("Http.get read: %w", err)
 			}
 			return runtime.StringVal{V: string(body)}, nil
+		},
+	}
+
+	httpGetResult := &runtime.BuiltinVal{
+		Name:  "Http.getResult",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			url := runtime.Deref(args[0]).(runtime.StringVal).V
+			resp, err := http.Get(url)
+			if err != nil {
+				return runtime.ADTVal{
+					Tag:     errTag,
+					TagName: "Error",
+					Payload: runtime.StringVal{V: err.Error()},
+				}, nil
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return runtime.ADTVal{
+					Tag:     errTag,
+					TagName: "Error",
+					Payload: runtime.StringVal{V: err.Error()},
+				}, nil
+			}
+			if resp.StatusCode >= 400 {
+				return runtime.ADTVal{
+					Tag:     errTag,
+					TagName: "Error",
+					Payload: runtime.StringVal{V: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))},
+				}, nil
+			}
+			return runtime.ADTVal{
+				Tag:     okTag,
+				TagName: "Ok",
+				Payload: runtime.StringVal{V: string(body)},
+			}, nil
 		},
 	}
 
@@ -171,9 +240,92 @@ func RegisterIONetJSON(vm *runtime.VM) {
 		},
 	}
 
+	methodFieldID := vm.Prog.Strings.InternString("Method")
+	pathFieldID := vm.Prog.Strings.InternString("Path")
+	bodyFieldID := vm.Prog.Strings.InternString("Body")
+
+	httpServeOnce := &runtime.BuiltinVal{
+		Name:  "Http.serveOnce",
+		Arity: 2,
+		Fn: func(parentVM *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			addr := runtime.Deref(args[0]).(runtime.StringVal).V
+			handlerFn := runtime.Deref(args[1])
+
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return nil, fmt.Errorf("Http.serveOnce listen: %w", err)
+			}
+
+			var closeOnce sync.Once
+			var srv *http.Server
+			srv = &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					defer closeOnce.Do(func() {
+						go func() { _ = srv.Close() }()
+					})
+					reqBody, _ := io.ReadAll(r.Body)
+					_ = r.Body.Close()
+
+					reqRec := &runtime.RecordVal{
+						Fields: map[token.StringID]runtime.Value{
+							methodFieldID: runtime.StringVal{V: r.Method},
+							pathFieldID:   runtime.StringVal{V: r.URL.Path},
+							bodyFieldID:   runtime.StringVal{V: string(reqBody)},
+						},
+						ByName: map[string]runtime.Value{
+							"Method": runtime.StringVal{V: r.Method},
+							"Path":   runtime.StringVal{V: r.URL.Path},
+							"Body":   runtime.StringVal{V: string(reqBody)},
+						},
+					}
+
+					workerVM := cloneVMForAsync(parentVM)
+					res, applyErr := workerVM.Apply(handlerFn, reqRec)
+					if applyErr != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(applyErr.Error()))
+						return
+					}
+
+					status := http.StatusOK
+					respBody := ""
+					if rec, ok := runtime.Deref(res).(*runtime.RecordVal); ok {
+						if stVal, hasSt := rec.ByName["Status"]; hasSt {
+							if iv, okInt := runtime.Deref(stVal).(runtime.IntVal); okInt {
+								status = int(iv.V)
+							}
+						}
+						if bdVal, hasBd := rec.ByName["Body"]; hasBd {
+							if sv, okStr := runtime.Deref(bdVal).(runtime.StringVal); okStr {
+								respBody = sv.V
+							} else {
+								respBody = bdVal.String()
+							}
+						}
+					} else if sv, okStr := runtime.Deref(res).(runtime.StringVal); okStr {
+						respBody = sv.V
+					} else if res != nil {
+						respBody = res.String()
+					}
+
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(respBody))
+				}),
+			}
+
+			go func() {
+				_ = srv.Serve(ln)
+			}()
+
+			return runtime.StringVal{V: "http://" + ln.Addr().String()}, nil
+		},
+	}
+
 	defineModuleRecord(vm, "Http", map[string]runtime.Value{
-		"get":  httpGet,
-		"post": httpPost,
+		"get":       httpGet,
+		"getResult": httpGetResult,
+		"post":      httpPost,
+		"serveOnce": httpServeOnce,
 	})
 
 	csvDecode := &runtime.BuiltinVal{

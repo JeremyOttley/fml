@@ -257,6 +257,7 @@ else
 | :--- | :--- | :--- |
 | `Json.encode` | `'a -> string` | Serializes any FML value to a compact JSON string. |
 | `Json.decode` | `string -> 'b` | Parses a JSON string into native FML records, lists, and primitives. |
+| `Json.tryDecode` | `string -> Result<'b, string>` | Safely parses a JSON string into `Ok value` or `Error msg` on malformed input. |
 
 ### Example
 ```fsharp
@@ -281,7 +282,9 @@ let port = parsed.Port                 // 9000
 | Symbol | Signature | Description |
 | :--- | :--- | :--- |
 | `Http.get` | `string -> string` | Performs an HTTP `GET` request to `url` and returns the response body as a `string`. |
+| `Http.getResult` | `string -> Result<string, string>` | Performs an HTTP `GET` request and returns `Ok body` or `Error msg` on network/HTTP 4xx/5xx error. |
 | `Http.post` | `string -> string -> string -> string` | Performs an HTTP `POST` to `url` with `contentType` and `body`, returning the response body as a `string`. |
+| `Http.serveOnce` | `string -> ({ Method: string; Path: string; Body: string } -> { Status: int; Body: string }) -> string` | Binds a local HTTP listener on `addr` (`"127.0.0.1:0"`), serves one request using the FML handler closure, and returns the bound `"http://host:port"` URL. |
 
 ### Example
 ```fsharp

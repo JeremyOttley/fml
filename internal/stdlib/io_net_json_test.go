@@ -66,3 +66,47 @@ if exists && getObj.ok then port + postObj.code else 0
 		t.Fatalf("expected 8281 from File/Json/Http integration, got %v", res)
 	}
 }
+
+func TestHttpServeOnceGetResultAndJsonTryDecode(t *testing.T) {
+	src := `
+let baseUrl = Http.serveOnce "127.0.0.1:0" (fun req ->
+    let payload = Json.encode { Method = req.Method; Path = req.Path; Value = 321 }
+    { Status = 200; Body = payload }
+)
+
+let respRes = Http.getResult (baseUrl + "/api/v1/health")
+let bodyText = Result.defaultValue "{}" respRes
+let parsedRes = Json.tryDecode bodyText
+let badJsonRes = Json.tryDecode "{invalid_json"
+
+let score =
+    match parsedRes with
+    | Ok obj ->
+        if (obj.Method == "GET") && (obj.Path == "/api/v1/health") then obj.Value else 0
+    | Error _ -> 0
+
+if (Result.isOk respRes) && (Result.isError badJsonRes) then
+    score
+else
+    0
+`
+	p, root, err := parser.ParseSource([]byte(src), nil)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	if _, err := chk.Infer(root); err != nil {
+		t.Fatalf("type error: %v", err)
+	}
+	prog := ir.Lower(p.Arena, chk.Types, root)
+	vm := runtime.NewVM(prog)
+	RegisterAll(vm)
+	res, err := vm.Run()
+	if err != nil {
+		t.Fatalf("runtime error: %v", err)
+	}
+	if iv, ok := res.(runtime.IntVal); !ok || iv.V != 321 {
+		t.Fatalf("expected 321 from Http.serveOnce + Http.getResult + Json.tryDecode, got %v", res)
+	}
+}
+

@@ -312,6 +312,21 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Crypto.base64Encode"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
 	c.define(s.InternString("Crypto.base64Decode"), TypeScheme{Body: arrow(TypeString, resOf(TypeString, TypeString))}, false)
 	c.define(s.InternString("Crypto.uuid4"), TypeScheme{Body: arrow(TypeUnit, TypeString)}, false)
+
+	// File, Json, and Http combinators
+	c.define(s.InternString("File.readText"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+	c.define(s.InternString("File.writeText"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeUnit))}, false)
+	c.define(s.InternString("File.exists"), TypeScheme{Body: arrow(TypeString, TypeBool)}, false)
+	c.define(s.InternString("File.openReader"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+
+	c.define(s.InternString("Json.encode"), TypeScheme{Vars: []TypeID{a}, Body: arrow(a, TypeString)}, false)
+	c.define(s.InternString("Json.decode"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeString, a)}, false)
+	c.define(s.InternString("Json.tryDecode"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeString, resOf(a, TypeString))}, false)
+
+	c.define(s.InternString("Http.get"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+	c.define(s.InternString("Http.getResult"), TypeScheme{Body: arrow(TypeString, resOf(TypeString, TypeString))}, false)
+	c.define(s.InternString("Http.post"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, arrow(TypeString, TypeString)))}, false)
+	c.define(s.InternString("Http.serveOnce"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(TypeString, arrow(arrow(a, b), TypeString))}, false)
 }
 
 func (c *Checker) pushScope() {
