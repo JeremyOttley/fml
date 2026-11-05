@@ -200,7 +200,36 @@ else
 	}
 }
 
+func TestListAndArrayExtendedCombinators(t *testing.T) {
+	src := `
+let nums = [1; 2; 3; 4; 5]
+let found = List.tryFind (fun x -> x > 3) nums |> Option.defaultValue 0
+let missing = List.tryFind (fun x -> x > 10) nums
+let hasEven = List.exists (fun x -> x == 4) nums
+let allPos = List.forall (fun x -> x > 0) nums
+let zipped = List.zip [1; 2] [10; 20]
+let (evens, odds) = List.partition (fun x -> (x % 2) == 0) [1; 2; 3; 4]
+let chosen = List.choose (fun x -> if x > 2 then Some (x * 10) else None) [1; 2; 3; 4]
+let collected = List.collect (fun x -> [x; x * 10]) [1; 2]
 
+let arr = [| 10; 20; 30; 40 |]
+let arrFiltered = Array.filter (fun x -> x >= 20) arr
+let arrSum = Array.fold (fun acc x -> acc + x) 0 arrFiltered
 
-
+if (Option.isNone missing) && hasEven && allPos && (List.length zipped == 2) then
+    found + List.sum evens + List.sum odds + List.sum chosen + List.sum collected + arrSum
+else
+    0
+`
+	val := evalFML(t, src)
+	// found = 4
+	// evens = [2; 4] -> 6; odds = [1; 3] -> 4
+	// chosen = [30; 40] -> 70
+	// collected = [1; 10; 2; 20] -> 33
+	// arrSum = 20 + 30 + 40 = 90
+	// Total = 4 + 6 + 4 + 70 + 33 + 90 = 207
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 207 {
+		t.Fatalf("expected 207 from extended List/Array combinators, got %v", val)
+	}
+}
 

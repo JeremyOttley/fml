@@ -230,19 +230,187 @@ func registerListModule(vm *runtime.VM) {
 			return runtime.IntVal{V: sum}, nil
 		},
 	}
+	listTryFind := &runtime.BuiltinVal{
+		Name:  "List.tryFind",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			for _, elem := range items {
+				res, err := vm.Apply(pred, elem)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					tag := vm.Prog.Strings.InternString("Some")
+					return runtime.ADTVal{Tag: tag, TagName: "Some", Payload: elem}, nil
+				}
+			}
+			tag := vm.Prog.Strings.InternString("None")
+			return runtime.ADTVal{Tag: tag, TagName: "None"}, nil
+		},
+	}
+	listExists := &runtime.BuiltinVal{
+		Name:  "List.exists",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			for _, elem := range items {
+				res, err := vm.Apply(pred, elem)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					return runtime.BoolVal{V: true}, nil
+				}
+			}
+			return runtime.BoolVal{V: false}, nil
+		},
+	}
+	listForall := &runtime.BuiltinVal{
+		Name:  "List.forall",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			for _, elem := range items {
+				res, err := vm.Apply(pred, elem)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); !ok || !bv.V {
+					return runtime.BoolVal{V: false}, nil
+				}
+			}
+			return runtime.BoolVal{V: true}, nil
+		},
+	}
+	listZip := &runtime.BuiltinVal{
+		Name:  "List.zip",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			xs, err := listToSlice(args[0])
+			if err != nil {
+				return nil, err
+			}
+			ys, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			n := len(xs)
+			if len(ys) < n {
+				n = len(ys)
+			}
+			out := make([]runtime.Value, n)
+			for i := 0; i < n; i++ {
+				out[i] = runtime.TupleVal{Elems: []runtime.Value{xs[i], ys[i]}}
+			}
+			return runtime.SliceToList(out), nil
+		},
+	}
+	listPartition := &runtime.BuiltinVal{
+		Name:  "List.partition",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			var trues, falses []runtime.Value
+			for _, elem := range items {
+				res, err := vm.Apply(pred, elem)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					trues = append(trues, elem)
+				} else {
+					falses = append(falses, elem)
+				}
+			}
+			return runtime.TupleVal{Elems: []runtime.Value{
+				runtime.SliceToList(trues),
+				runtime.SliceToList(falses),
+			}}, nil
+		},
+	}
+	listChoose := &runtime.BuiltinVal{
+		Name:  "List.choose",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			chooser := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			var kept []runtime.Value
+			for _, elem := range items {
+				res, err := vm.Apply(chooser, elem)
+				if err != nil {
+					return nil, err
+				}
+				if adt, ok := runtime.Deref(res).(runtime.ADTVal); ok && adt.TagName == "Some" {
+					kept = append(kept, runtime.Deref(adt.Payload))
+				}
+			}
+			return runtime.SliceToList(kept), nil
+		},
+	}
+	listCollect := &runtime.BuiltinVal{
+		Name:  "List.collect",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			mapper := runtime.Deref(args[0])
+			items, err := listToSlice(args[1])
+			if err != nil {
+				return nil, err
+			}
+			var flat []runtime.Value
+			for _, elem := range items {
+				subListVal, err := vm.Apply(mapper, elem)
+				if err != nil {
+					return nil, err
+				}
+				subItems, err := listToSlice(subListVal)
+				if err != nil {
+					return nil, err
+				}
+				flat = append(flat, subItems...)
+			}
+			return runtime.SliceToList(flat), nil
+		},
+	}
 
 	defineModuleRecord(vm, "List", map[string]runtime.Value{
-		"empty":   runtime.EmptyList,
-		"isEmpty": listIsEmpty,
-		"length":  listLength,
-		"head":    listHead,
-		"tail":    listTail,
-		"rev":     listRev,
-		"map":     listMap,
-		"filter":  listFilter,
-		"fold":    listFold,
-		"sortBy":  listSortBy,
-		"sum":     listSum,
+		"empty":     runtime.EmptyList,
+		"isEmpty":   listIsEmpty,
+		"length":    listLength,
+		"head":      listHead,
+		"tail":      listTail,
+		"rev":       listRev,
+		"map":       listMap,
+		"filter":    listFilter,
+		"fold":      listFold,
+		"sortBy":    listSortBy,
+		"sum":       listSum,
+		"tryFind":   listTryFind,
+		"exists":    listExists,
+		"forall":    listForall,
+		"zip":       listZip,
+		"partition": listPartition,
+		"choose":    listChoose,
+		"collect":   listCollect,
 	})
 }
 
@@ -309,6 +477,52 @@ func registerArrayModule(vm *runtime.VM) {
 			return &runtime.ArrayVal{Elems: out}, nil
 		},
 	}
+	arrFilter := &runtime.BuiltinVal{
+		Name:  "Array.filter",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			av, ok := runtime.Deref(args[1]).(*runtime.ArrayVal)
+			if !ok {
+				return nil, fmt.Errorf("Array.filter: expected Array, got %v", args[1])
+			}
+			var kept []runtime.Value
+			for _, elem := range av.Elems {
+				v := runtime.Deref(elem)
+				res, err := vm.Apply(pred, v)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					kept = append(kept, v)
+				}
+			}
+			return &runtime.ArrayVal{Elems: kept}, nil
+		},
+	}
+	arrFold := &runtime.BuiltinVal{
+		Name:  "Array.fold",
+		Arity: 3,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			folder := runtime.Deref(args[0])
+			state := runtime.Deref(args[1])
+			av, ok := runtime.Deref(args[2]).(*runtime.ArrayVal)
+			if !ok {
+				return nil, fmt.Errorf("Array.fold: expected Array, got %v", args[2])
+			}
+			for _, elem := range av.Elems {
+				partial, err := vm.Apply(folder, state)
+				if err != nil {
+					return nil, err
+				}
+				state, err = vm.Apply(partial, runtime.Deref(elem))
+				if err != nil {
+					return nil, err
+				}
+			}
+			return state, nil
+		},
+	}
 	arrOfList := &runtime.BuiltinVal{
 		Name:  "Array.ofList",
 		Arity: 1,
@@ -337,6 +551,8 @@ func registerArrayModule(vm *runtime.VM) {
 		"get":    arrGet,
 		"set":    arrSet,
 		"map":    arrMap,
+		"filter": arrFilter,
+		"fold":   arrFold,
 		"ofList": arrOfList,
 		"toList": arrToList,
 	})

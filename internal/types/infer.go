@@ -187,6 +187,10 @@ func (c *Checker) registerCombinatorTypes() {
 	e := c.Types.FreshVar()
 
 	// List combinators
+	zipStart, zipCount := c.Types.AddExtra([]TypeID{a, b})
+	zipPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: zipStart, Right: zipCount})
+	partStart, partCount := c.Types.AddExtra([]TypeID{listOf(a), listOf(a)})
+	partPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: partStart, Right: partCount})
 	c.define(s.InternString("List.empty"), TypeScheme{Vars: []TypeID{a}, Body: listOf(a)}, false)
 	c.define(s.InternString("List.isEmpty"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), TypeBool)}, false)
 	c.define(s.InternString("List.length"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), TypeInt)}, false)
@@ -198,12 +202,21 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("List.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(listOf(b), a)))}, false)
 	c.define(s.InternString("List.sortBy"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(listOf(a), listOf(a)))}, false)
 	c.define(s.InternString("List.sum"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), a)}, false)
+	c.define(s.InternString("List.tryFind"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(listOf(a), optOf(a)))}, false)
+	c.define(s.InternString("List.exists"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(listOf(a), TypeBool))}, false)
+	c.define(s.InternString("List.forall"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(listOf(a), TypeBool))}, false)
+	c.define(s.InternString("List.zip"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(listOf(a), arrow(listOf(b), listOf(zipPairTy)))}, false)
+	c.define(s.InternString("List.partition"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(listOf(a), partPairTy))}, false)
+	c.define(s.InternString("List.choose"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, optOf(b)), arrow(listOf(a), listOf(b)))}, false)
+	c.define(s.InternString("List.collect"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, listOf(b)), arrow(listOf(a), listOf(b)))}, false)
 
 	// Array combinators
 	c.define(s.InternString("Array.length"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), TypeInt)}, false)
 	c.define(s.InternString("Array.get"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrow(TypeInt, a))}, false)
 	c.define(s.InternString("Array.set"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrow(TypeInt, arrow(a, TypeUnit)))}, false)
 	c.define(s.InternString("Array.map"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(arrOf(a), arrOf(b)))}, false)
+	c.define(s.InternString("Array.filter"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(arrOf(a), arrOf(a)))}, false)
+	c.define(s.InternString("Array.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(arrOf(b), a)))}, false)
 	c.define(s.InternString("Array.ofList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), arrOf(a))}, false)
 	c.define(s.InternString("Array.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), listOf(a))}, false)
 
