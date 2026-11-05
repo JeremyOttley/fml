@@ -123,6 +123,23 @@ type lspSemanticTokens struct {
 	Data []int `json:"data"`
 }
 
+type lspCommand struct {
+	Title     string `json:"title"`
+	Command   string `json:"command"`
+	Arguments []any  `json:"arguments,omitempty"`
+}
+
+type lspCodeLens struct {
+	Range   lspRange    `json:"range"`
+	Command *lspCommand `json:"command,omitempty"`
+}
+
+type lspFoldingRange struct {
+	StartLine int    `json:"startLine"`
+	EndLine   int    `json:"endLine"`
+	Kind      string `json:"kind,omitempty"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -210,6 +227,10 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"codeActionProvider":         true,
 				"inlayHintProvider":          true,
 				"workspaceSymbolProvider":    true,
+				"foldingRangeProvider":       true,
+				"codeLensProvider": map[string]any{
+					"resolveProvider": false,
+				},
 				"semanticTokensProvider": map[string]any{
 					"legend": map[string]any{
 						"tokenTypes": []string{
@@ -431,6 +452,28 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			toks := s.computeSemanticTokens(params.TextDocument.URI)
 			s.sendResponse(msg.ID, toks)
+		}
+
+	case "textDocument/codeLens":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			lenses := s.computeCodeLenses(params.TextDocument.URI)
+			s.sendResponse(msg.ID, lenses)
+		}
+
+	case "textDocument/foldingRange":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			ranges := s.computeFoldingRanges(params.TextDocument.URI)
+			s.sendResponse(msg.ID, ranges)
 		}
 
 	case "shutdown":
@@ -1466,6 +1509,178 @@ func (s *LSPServer) computeSemanticTokens(uri string) *lspSemanticTokens {
 		data = []int{}
 	}
 	return &lspSemanticTokens{Data: data}
+}
+
+func (s *LSPServer) computeCodeLenses(uri string) []lspCodeLens {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return []lspCodeLens{}
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return []lspCodeLens{}
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, _ = chk.Infer(root)
+
+	progNode := p.Arena.Get(root)
+	var stmts []uint32
+	if progNode.Kind == ast.KindProgram || progNode.Kind == ast.KindBlock {
+		stmts = p.Arena.ExtraSlice(progNode.Left, progNode.Right)
+	} else {
+		stmts = []uint32{uint32(root)}
+	}
+
+	out := make([]lspCodeLens, 0, len(stmts))
+	for _, rawID := range stmts {
+		id := ast.NodeID(rawID)
+		n := p.Arena.Get(id)
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			sym := token.StringID(n.Data)
+			if sym == token.NoString {
+				continue
+			}
+			name := p.Arena.Strings.String(sym)
+			rng := tokenRangeForDecl(p, int(n.TokenIdx), name)
+			if int(id) < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				tyStr := chk.Types.Format(chk.NodeTypes[id])
+				out = append(out, lspCodeLens{
+					Range: rng,
+					Command: &lspCommand{
+						Title:   fmt.Sprintf("val %s : %s", name, tyStr),
+						Command: "fml.showType",
+					},
+				})
+			}
+			if strings.HasPrefix(name, "test_") {
+				out = append(out, lspCodeLens{
+					Range: rng,
+					Command: &lspCommand{
+						Title:     "Run test",
+						Command:   "fml.runTest",
+						Arguments: []any{uri, name},
+					},
+				})
+			} else if strings.HasPrefix(name, "bench_") {
+				out = append(out, lspCodeLens{
+					Range: rng,
+					Command: &lspCommand{
+						Title:     "Run benchmark",
+						Command:   "fml.runBench",
+						Arguments: []any{uri, name},
+					},
+				})
+			}
+		}
+	}
+	return out
+}
+
+func (s *LSPServer) computeFoldingRanges(uri string) []lspFoldingRange {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return []lspFoldingRange{}
+	}
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil || root == ast.NoNode {
+		return []lspFoldingRange{}
+	}
+	toks := p.Tokens()
+
+	type linePair struct {
+		start int
+		end   int
+	}
+	seen := make(map[linePair]bool)
+	var out []lspFoldingRange
+
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindMatch,
+			ast.KindCompExpr, ast.KindSeq, ast.KindModule, ast.KindRecordType,
+			ast.KindDUType, ast.KindWhile, ast.KindForIn, ast.KindForTo:
+			minLine, maxLine := nodeLineBounds(p.Arena, toks, ast.NodeID(id), make(map[ast.NodeID]bool))
+			if maxLine > minLine && minLine >= 0 {
+				pair := linePair{start: minLine, end: maxLine}
+				if !seen[pair] {
+					seen[pair] = true
+					out = append(out, lspFoldingRange{
+						StartLine: minLine,
+						EndLine:   maxLine,
+						Kind:      "region",
+					})
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartLine != out[j].StartLine {
+			return out[i].StartLine < out[j].StartLine
+		}
+		return out[i].EndLine < out[j].EndLine
+	})
+	if out == nil {
+		return []lspFoldingRange{}
+	}
+	return out
+}
+
+func nodeLineBounds(arena *ast.Arena, toks []token.Token, id ast.NodeID, visited map[ast.NodeID]bool) (int, int) {
+	if id == ast.NoNode || int(id) >= len(arena.Nodes) || visited[id] {
+		return -1, -1
+	}
+	visited[id] = true
+	n := arena.Nodes[id]
+	minL, maxL := -1, -1
+	if n.Kind != ast.KindProgram && n.Kind != ast.KindBlock &&
+		(n.TokenIdx > 0 || id == 1) && int(n.TokenIdx) < len(toks) && toks[n.TokenIdx].Line > 0 {
+		l := int(toks[n.TokenIdx].Line) - 1
+		minL, maxL = l, l
+	}
+	merge := func(child ast.NodeID) {
+		cMin, cMax := nodeLineBounds(arena, toks, child, visited)
+		if cMin >= 0 {
+			if minL < 0 || cMin < minL {
+				minL = cMin
+			}
+			if cMax > maxL {
+				maxL = cMax
+			}
+		}
+	}
+
+	switch n.Kind {
+	case ast.KindProgram, ast.KindBlock, ast.KindTuple, ast.KindList, ast.KindArray,
+		ast.KindRecordLit, ast.KindRecordType, ast.KindDUType, ast.KindPatTuple,
+		ast.KindPatList, ast.KindPatRecord, ast.KindTypeTuple:
+		for _, ch := range arena.ExtraSlice(n.Left, n.Right) {
+			merge(ast.NodeID(ch))
+		}
+	case ast.KindLet, ast.KindLetMutable, ast.KindLetRec, ast.KindUse:
+		if n.Op == 1 {
+			for _, ch := range arena.ExtraSlice(n.Left, 3) {
+				merge(ast.NodeID(ch))
+			}
+		} else {
+			merge(ast.NodeID(n.Left))
+			merge(ast.NodeID(n.Right))
+		}
+	case ast.KindIf:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Right))
+		merge(ast.NodeID(n.Data))
+	case ast.KindMatchArm:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Data))
+		merge(ast.NodeID(n.Right))
+	default:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Right))
+	}
+	return minL, maxL
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {

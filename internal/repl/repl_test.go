@@ -386,3 +386,47 @@ func TestFormatFullSyntaxRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLSPCodeLensAndFoldingRanges(t *testing.T) {
+	doc := strings.Join([]string{
+		"let classify n =",
+		"    match n with",
+		"    | 0 -> \"zero\"",
+		"    | _ -> \"non-zero\"",
+		"let test_classify () = classify 0",
+		"let bench_classify () = classify 42",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///lens.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/codeLens","params":{"textDocument":{"uri":"file:///lens.fml"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/foldingRange","params":{"textDocument":{"uri":"file:///lens.fml"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"foldingRangeProvider":true`,
+		`"codeLensProvider"`,
+		`"title":"val classify : (int -> string)"`,
+		`"title":"Run test"`,
+		`"command":"fml.runTest"`,
+		`"title":"Run benchmark"`,
+		`"command":"fml.runBench"`,
+		`"startLine":0,"endLine":3,"kind":"region"`,
+		`"startLine":1,"endLine":3,"kind":"region"`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in codeLens or foldingRange response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
