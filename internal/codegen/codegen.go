@@ -216,12 +216,14 @@ func EmitGoSource(prog *ir.Program) ([]byte, error) {
 	buf.WriteString("package main\n\n")
 	buf.WriteString("import (\n")
 	buf.WriteString("\t\"fmt\"\n")
+	buf.WriteString("\t\"math\"\n")
 	buf.WriteString("\t\"os\"\n\n")
 	buf.WriteString("\t\"fml/internal/ir\"\n")
 	buf.WriteString("\t\"fml/internal/runtime\"\n")
 	buf.WriteString("\t\"fml/internal/stdlib\"\n")
 	buf.WriteString("\t\"fml/internal/token\"\n")
 	buf.WriteString(")\n\n")
+	buf.WriteString("var _ = math.Pi\n\n")
 
 	// Emit human-readable disassembly comments
 	buf.WriteString("// Lowered 10-Opcode IR Disassembly:\n")
@@ -534,6 +536,24 @@ func emitAOTScalarHelpers(buf *bytes.Buffer) {
 	buf.WriteString("\t}\n")
 	buf.WriteString("\treturn false\n")
 	buf.WriteString("}\n\n")
+
+	buf.WriteString("func aotAbsInt(x int64) int64 {\n\tif x < 0 {\n\t\treturn -x\n\t}\n\treturn x\n}\n\n")
+	buf.WriteString("func aotMinInt(a, b int64) int64 {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
+	buf.WriteString("func aotMaxInt(a, b int64) int64 {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
+}
+
+func resolveMathSymbol(prog *ir.Program, id ir.InstrID) string {
+	if prog == nil || id == ir.NoInstr || int(id) >= len(prog.Instrs) {
+		return ""
+	}
+	ins := prog.Instrs[id]
+	if ins.Kind == ir.IRLoad && ins.SubOp == ir.LoadRecordField && ins.Aux != 0 {
+		return prog.Strings.String(token.StringID(ins.Aux))
+	}
+	if ins.Kind == ir.IRVar && ins.Data != 0 {
+		return prog.Strings.String(token.StringID(ins.Data))
+	}
+	return ""
 }
 
 // analyzeAOTScalars resolves lexical variable bindings and performs fixed-point
@@ -626,6 +646,36 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 					revArgs = append(revArgs, ir.InstrID(prog.Instrs[spine].Arg1))
 					spine = ir.InstrID(prog.Instrs[spine].Arg0)
 				}
+				switch resolveMathSymbol(prog, spine) {
+				case "Math.sqrt", "Math.sin", "Math.cos", "Math.floor", "Math.ceil", "Math.round":
+					if len(revArgs) == 1 {
+						changed = setInstr(revArgs[0], scalarFloat) || changed
+						changed = setInstr(id, scalarFloat) || changed
+					}
+				case "Math.abs":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.instr) {
+						m := joinScalar(info.instr[id], info.instr[revArgs[0]])
+						if m == scalarInt || m == scalarFloat || m == scalarConflict {
+							changed = setInstr(id, m) || changed
+							changed = setInstr(revArgs[0], m) || changed
+						}
+					}
+				case "Math.pow":
+					if len(revArgs) == 2 {
+						changed = setInstr(revArgs[1], scalarFloat) || changed
+						changed = setInstr(revArgs[0], scalarFloat) || changed
+						changed = setInstr(id, scalarFloat) || changed
+					}
+				case "Math.min", "Math.max":
+					if len(revArgs) == 2 && int(revArgs[1]) < len(info.instr) && int(revArgs[0]) < len(info.instr) {
+						m := joinScalar(info.instr[id], joinScalar(info.instr[revArgs[1]], info.instr[revArgs[0]]))
+						if m == scalarInt || m == scalarFloat || m == scalarConflict {
+							changed = setInstr(id, m) || changed
+							changed = setInstr(revArgs[1], m) || changed
+							changed = setInstr(revArgs[0], m) || changed
+						}
+					}
+				}
 				if defID, ok := info.varDef[spine]; ok {
 					if sig, okSig := fnSigs[defID]; okSig && len(revArgs) <= len(sig.paramDefs) {
 						for k := 0; k < len(revArgs); k++ {
@@ -645,6 +695,8 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 					m := joinScalar(info.instr[id], info.def[defID])
 					changed = setInstr(id, m) || changed
 					changed = setDef(defID, m) || changed
+				} else if resolveMathSymbol(prog, id) == "Math.pi" {
+					changed = setInstr(id, scalarFloat) || changed
 				}
 
 			case ir.IRLet:
@@ -678,6 +730,8 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 			case ir.IRLoad:
 				if ins.SubOp == ir.LoadADTTag || ins.SubOp == ir.LoadListIsEmpty {
 					changed = setInstr(id, scalarInt) || changed
+				} else if resolveMathSymbol(prog, id) == "Math.pi" {
+					changed = setInstr(id, scalarFloat) || changed
 				}
 
 			case ir.IRSwitch:
@@ -1063,6 +1117,9 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 		}
 
 	case ir.IRVar:
+		if wantKind == scalarFloat && resolveMathSymbol(prog, id) == "Math.pi" {
+			return "float64(math.Pi)", true
+		}
 		defID, ok := scalars.varDef[id]
 		if !ok || defID == ir.NoInstr || scalars.def[defID] != wantKind {
 			return "", false
@@ -1080,15 +1137,102 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 			return fmt.Sprintf("aotLoadBool(vm, env, token.StringID(%d))", ins.Data), true
 		}
 
-	case ir.IRApp:
-		if candidates == nil {
-			return "", false
+	case ir.IRLoad:
+		if wantKind == scalarFloat && resolveMathSymbol(prog, id) == "Math.pi" {
+			return "float64(math.Pi)", true
 		}
+
+	case ir.IRSwitch:
+		count := uint32(ins.Data)
+		if count == 1 && int(ins.Arg1+1) < len(prog.Extra) {
+			caseTag := prog.Extra[ins.Arg1]
+			target := ir.InstrID(prog.Extra[ins.Arg1+1])
+			if caseTag == 0 || caseTag == 1 {
+				condExpr, okC := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarBool, scalars, candidates, localVars)
+				tExpr, okT := nativeScalarExpr(prog, target, wantKind, scalars, candidates, localVars)
+				aExpr, okA := nativeScalarExpr(prog, ir.InstrID(ins.Aux), wantKind, scalars, candidates, localVars)
+				if okC && okT && okA {
+					goTy := goTypeForScalar(wantKind)
+					if caseTag == 1 {
+						return fmt.Sprintf("func() %s { if %s { return %s }; return %s }()", goTy, condExpr, tExpr, aExpr), true
+					}
+					return fmt.Sprintf("func() %s { if !(%s) { return %s }; return %s }()", goTy, condExpr, tExpr, aExpr), true
+				}
+			}
+		}
+
+	case ir.IRApp:
 		var revArgs []ir.InstrID
 		spine := id
 		for spine != ir.NoInstr && int(spine) < len(prog.Instrs) && prog.Instrs[spine].Kind == ir.IRApp {
 			revArgs = append(revArgs, ir.InstrID(prog.Instrs[spine].Arg1))
 			spine = ir.InstrID(prog.Instrs[spine].Arg0)
+		}
+		switch mathSym := resolveMathSymbol(prog, spine); mathSym {
+		case "Math.sqrt", "Math.sin", "Math.cos", "Math.floor", "Math.ceil", "Math.round":
+			if wantKind == scalarFloat && len(revArgs) == 1 {
+				if a0, ok0 := nativeScalarExpr(prog, revArgs[0], scalarFloat, scalars, candidates, localVars); ok0 {
+					goFn := "math.Sqrt"
+					switch mathSym {
+					case "Math.sin":
+						goFn = "math.Sin"
+					case "Math.cos":
+						goFn = "math.Cos"
+					case "Math.floor":
+						goFn = "math.Floor"
+					case "Math.ceil":
+						goFn = "math.Ceil"
+					case "Math.round":
+						goFn = "math.Round"
+					}
+					return fmt.Sprintf("%s(%s)", goFn, a0), true
+				}
+			}
+		case "Math.abs":
+			if len(revArgs) == 1 {
+				if wantKind == scalarFloat {
+					if a0, ok0 := nativeScalarExpr(prog, revArgs[0], scalarFloat, scalars, candidates, localVars); ok0 {
+						return fmt.Sprintf("math.Abs(%s)", a0), true
+					}
+				} else if wantKind == scalarInt {
+					if a0, ok0 := nativeScalarExpr(prog, revArgs[0], scalarInt, scalars, candidates, localVars); ok0 {
+						return fmt.Sprintf("aotAbsInt(%s)", a0), true
+					}
+				}
+			}
+		case "Math.pow":
+			if wantKind == scalarFloat && len(revArgs) == 2 {
+				a0, ok0 := nativeScalarExpr(prog, revArgs[1], scalarFloat, scalars, candidates, localVars)
+				a1, ok1 := nativeScalarExpr(prog, revArgs[0], scalarFloat, scalars, candidates, localVars)
+				if ok0 && ok1 {
+					return fmt.Sprintf("math.Pow(%s, %s)", a0, a1), true
+				}
+			}
+		case "Math.min", "Math.max":
+			if len(revArgs) == 2 {
+				if wantKind == scalarFloat {
+					a0, ok0 := nativeScalarExpr(prog, revArgs[1], scalarFloat, scalars, candidates, localVars)
+					a1, ok1 := nativeScalarExpr(prog, revArgs[0], scalarFloat, scalars, candidates, localVars)
+					if ok0 && ok1 {
+						if mathSym == "Math.min" {
+							return fmt.Sprintf("math.Min(%s, %s)", a0, a1), true
+						}
+						return fmt.Sprintf("math.Max(%s, %s)", a0, a1), true
+					}
+				} else if wantKind == scalarInt {
+					a0, ok0 := nativeScalarExpr(prog, revArgs[1], scalarInt, scalars, candidates, localVars)
+					a1, ok1 := nativeScalarExpr(prog, revArgs[0], scalarInt, scalars, candidates, localVars)
+					if ok0 && ok1 {
+						if mathSym == "Math.min" {
+							return fmt.Sprintf("aotMinInt(%s, %s)", a0, a1), true
+						}
+						return fmt.Sprintf("aotMaxInt(%s, %s)", a0, a1), true
+					}
+				}
+			}
+		}
+		if candidates == nil {
+			return "", false
 		}
 		defID, ok := scalars.varDef[spine]
 		if !ok {
@@ -1183,6 +1327,13 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 								return fmt.Sprintf("(%s / float64(%s))", lhs, strconv.FormatFloat(rf, 'g', -1, 64)), true
 							}
 						}
+					}
+				}
+				if localVars != nil {
+					lhs, okL := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarFloat, scalars, candidates, localVars)
+					rhs, okR := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarFloat, scalars, candidates, localVars)
+					if okL && okR {
+						return fmt.Sprintf("(%s / %s)", lhs, rhs), true
 					}
 				}
 			}

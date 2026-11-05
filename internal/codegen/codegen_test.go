@@ -421,6 +421,67 @@ printfn (sumTo 1000000 0)
 	}
 }
 
+func TestAOTNativeFloat64BoolAndMathSpecialization(t *testing.T) {
+	src := `
+let isClose (a: float) (b: float) (eps: float) =
+    Math.abs (a - b) < eps
 
+let rec approxSqrt (guess: float) (x: float) (steps: int) =
+    if steps <= 0 || isClose (guess * guess) x 0.000001 then
+        guess
+    else
+        approxSqrt ((guess + (x / guess)) / 2.0) x (steps - 1)
 
+let hyp (a: float) (b: float) =
+    Math.sqrt (Math.pow a 2.0 + Math.pow b 2.0)
+
+let s144 = Math.round (approxSqrt 10.0 144.0 20)
+let h34 = hyp 3.0 4.0
+printfn (s144 + h34)
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_float_math.fml")
+	binPath := filepath.Join(tmpDir, "native_float_math_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for isClose",
+		"(p_0 float64, p_1 float64, p_2 float64) bool",
+		"// Native unboxed Go function for approxSqrt",
+		"(p_0 float64, p_1 float64, p_2 int64) float64",
+		"// Native unboxed Go function for hyp",
+		"math.Sqrt(",
+		"math.Pow(",
+		"math.Abs(",
+		"continue aotTailLoop",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	if got := strings.TrimSpace(string(out)); got != "17" {
+		t.Fatalf("expected '17' (12 + 5), got %q", got)
+	}
+}
 
