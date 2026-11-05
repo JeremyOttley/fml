@@ -140,6 +140,25 @@ type lspFoldingRange struct {
 	Kind      string `json:"kind,omitempty"`
 }
 
+type lspCallHierarchyItem struct {
+	Name           string   `json:"name"`
+	Kind           int      `json:"kind"`
+	Detail         string   `json:"detail,omitempty"`
+	URI            string   `json:"uri"`
+	Range          lspRange `json:"range"`
+	SelectionRange lspRange `json:"selectionRange"`
+}
+
+type lspCallHierarchyIncomingCall struct {
+	From       lspCallHierarchyItem `json:"from"`
+	FromRanges []lspRange           `json:"fromRanges"`
+}
+
+type lspCallHierarchyOutgoingCall struct {
+	To         lspCallHierarchyItem `json:"to"`
+	FromRanges []lspRange           `json:"fromRanges"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -228,6 +247,7 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"inlayHintProvider":          true,
 				"workspaceSymbolProvider":    true,
 				"foldingRangeProvider":       true,
+				"callHierarchyProvider":      true,
 				"codeLensProvider": map[string]any{
 					"resolveProvider": false,
 				},
@@ -474,6 +494,36 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			ranges := s.computeFoldingRanges(params.TextDocument.URI)
 			s.sendResponse(msg.ID, ranges)
+		}
+
+	case "textDocument/prepareCallHierarchy":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			items := s.computePrepareCallHierarchy(params.TextDocument.URI, params.Position)
+			s.sendResponse(msg.ID, items)
+		}
+
+	case "callHierarchy/incomingCalls":
+		var params struct {
+			Item lspCallHierarchyItem `json:"item"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			calls := s.computeIncomingCalls(params.Item)
+			s.sendResponse(msg.ID, calls)
+		}
+
+	case "callHierarchy/outgoingCalls":
+		var params struct {
+			Item lspCallHierarchyItem `json:"item"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			calls := s.computeOutgoingCalls(params.Item)
+			s.sendResponse(msg.ID, calls)
 		}
 
 	case "shutdown":
@@ -1681,6 +1731,242 @@ func nodeLineBounds(arena *ast.Arena, toks []token.Token, id ast.NodeID, visited
 		merge(ast.NodeID(n.Right))
 	}
 	return minL, maxL
+}
+
+type callHierarchyDecl struct {
+	item      lspCallHierarchyItem
+	calls     map[string][]lspRange
+	callOrder []string
+}
+
+func (s *LSPServer) computePrepareCallHierarchy(uri string, pos lspPosition) []lspCallHierarchyItem {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return []lspCallHierarchyItem{}
+	}
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return []lspCallHierarchyItem{}
+	}
+
+	targetLine := uint16(pos.Line + 1)
+	targetCol := uint16(pos.Character + 1)
+	var symName string
+	for _, tk := range p.Tokens() {
+		if tk.Line == targetLine {
+			spanLen := uint16(tk.End - tk.Start)
+			if spanLen == 0 {
+				spanLen = 1
+			}
+			if targetCol >= tk.Col && targetCol <= tk.Col+spanLen {
+				symName = string(tk.Slice(p.Source()))
+				break
+			}
+		}
+	}
+	if symName == "" {
+		return []lspCallHierarchyItem{}
+	}
+
+	for _, decl := range collectCallHierarchyDecls(uri, text) {
+		if decl.item.Name == symName {
+			return []lspCallHierarchyItem{decl.item}
+		}
+	}
+
+	docURIs := make([]string, 0, len(s.Docs))
+	for docURI := range s.Docs {
+		if docURI != uri {
+			docURIs = append(docURIs, docURI)
+		}
+	}
+	sort.Strings(docURIs)
+	for _, docURI := range docURIs {
+		for _, decl := range collectCallHierarchyDecls(docURI, s.Docs[docURI]) {
+			if decl.item.Name == symName {
+				return []lspCallHierarchyItem{decl.item}
+			}
+		}
+	}
+	return []lspCallHierarchyItem{}
+}
+
+func (s *LSPServer) computeIncomingCalls(target lspCallHierarchyItem) []lspCallHierarchyIncomingCall {
+	if target.Name == "" {
+		return []lspCallHierarchyIncomingCall{}
+	}
+	docURIs := make([]string, 0, len(s.Docs))
+	for docURI := range s.Docs {
+		docURIs = append(docURIs, docURI)
+	}
+	sort.Strings(docURIs)
+
+	var out []lspCallHierarchyIncomingCall
+	for _, docURI := range docURIs {
+		for _, decl := range collectCallHierarchyDecls(docURI, s.Docs[docURI]) {
+			if ranges := decl.calls[target.Name]; len(ranges) > 0 {
+				out = append(out, lspCallHierarchyIncomingCall{
+					From:       decl.item,
+					FromRanges: ranges,
+				})
+			}
+		}
+	}
+	if out == nil {
+		return []lspCallHierarchyIncomingCall{}
+	}
+	return out
+}
+
+func (s *LSPServer) computeOutgoingCalls(source lspCallHierarchyItem) []lspCallHierarchyOutgoingCall {
+	if source.Name == "" {
+		return []lspCallHierarchyOutgoingCall{}
+	}
+	docURIs := make([]string, 0, len(s.Docs))
+	for docURI := range s.Docs {
+		docURIs = append(docURIs, docURI)
+	}
+	sort.Strings(docURIs)
+
+	declByName := make(map[string]lspCallHierarchyItem)
+	var sourceDecl *callHierarchyDecl
+	for _, docURI := range docURIs {
+		decls := collectCallHierarchyDecls(docURI, s.Docs[docURI])
+		for i := range decls {
+			d := decls[i]
+			if _, exists := declByName[d.item.Name]; !exists || docURI == source.URI {
+				declByName[d.item.Name] = d.item
+			}
+			if d.item.Name == source.Name && (sourceDecl == nil || docURI == source.URI) {
+				copied := d
+				sourceDecl = &copied
+			}
+		}
+	}
+	if sourceDecl == nil {
+		return []lspCallHierarchyOutgoingCall{}
+	}
+
+	var out []lspCallHierarchyOutgoingCall
+	for _, calleeName := range sourceDecl.callOrder {
+		if targetItem, ok := declByName[calleeName]; ok {
+			out = append(out, lspCallHierarchyOutgoingCall{
+				To:         targetItem,
+				FromRanges: sourceDecl.calls[calleeName],
+			})
+		}
+	}
+	if out == nil {
+		return []lspCallHierarchyOutgoingCall{}
+	}
+	return out
+}
+
+func collectCallHierarchyDecls(uri, text string) []callHierarchyDecl {
+	p, root, err := parser.ParseSource([]byte(text), nil)
+	if err != nil || root == ast.NoNode {
+		return nil
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	_, _ = chk.Infer(root)
+
+	toks := p.Tokens()
+	lines := strings.Split(text, "\n")
+	var out []callHierarchyDecl
+
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			if n.Op == 1 || n.Data == 0 {
+				continue
+			}
+			name := p.Arena.Strings.String(token.StringID(n.Data))
+			if name == "" {
+				continue
+			}
+			selRng := tokenRangeForDecl(p, int(n.TokenIdx), name)
+			fullRng := selRng
+			minL, maxL := nodeLineBounds(p.Arena, toks, ast.NodeID(id), make(map[ast.NodeID]bool))
+			if minL >= 0 && maxL >= minL && maxL < len(lines) {
+				fullRng = lspRange{
+					Start: lspPosition{Line: minL, Character: selRng.Start.Character},
+					End:   lspPosition{Line: maxL, Character: len(lines[maxL])},
+				}
+			}
+			symKind := 13 // Variable
+			if ast.NodeID(n.Left) != ast.NoNode && p.Arena.Get(ast.NodeID(n.Left)).Kind == ast.KindLambda {
+				symKind = 12 // Function
+			}
+			var detail string
+			if id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				detail = chk.Types.Format(chk.NodeTypes[id])
+			}
+			decl := callHierarchyDecl{
+				item: lspCallHierarchyItem{
+					Name:           name,
+					Kind:           symKind,
+					Detail:         detail,
+					URI:            uri,
+					Range:          fullRng,
+					SelectionRange: selRng,
+				},
+				calls: make(map[string][]lspRange),
+			}
+			collectSubtreeIdentCalls(p, ast.NodeID(n.Left), make(map[ast.NodeID]bool), &decl)
+			out = append(out, decl)
+		}
+	}
+	return out
+}
+
+func collectSubtreeIdentCalls(p *parser.Parser, id ast.NodeID, visited map[ast.NodeID]bool, decl *callHierarchyDecl) {
+	if id == ast.NoNode || int(id) >= len(p.Arena.Nodes) || visited[id] {
+		return
+	}
+	visited[id] = true
+	n := p.Arena.Nodes[id]
+
+	switch n.Kind {
+	case ast.KindIdent:
+		if n.Data != 0 {
+			callee := p.Arena.Strings.String(token.StringID(n.Data))
+			if callee != "" {
+				rng := tokenRangeForDecl(p, int(n.TokenIdx), callee)
+				if _, seen := decl.calls[callee]; !seen {
+					decl.callOrder = append(decl.callOrder, callee)
+				}
+				decl.calls[callee] = append(decl.calls[callee], rng)
+			}
+		}
+	case ast.KindProgram, ast.KindBlock, ast.KindTuple, ast.KindList, ast.KindArray,
+		ast.KindRecordLit, ast.KindRecordType, ast.KindDUType, ast.KindPatTuple,
+		ast.KindPatList, ast.KindPatRecord, ast.KindTypeTuple:
+		for _, ch := range p.Arena.ExtraSlice(n.Left, n.Right) {
+			collectSubtreeIdentCalls(p, ast.NodeID(ch), visited, decl)
+		}
+	case ast.KindLet, ast.KindLetMutable, ast.KindLetRec, ast.KindUse:
+		if n.Op == 1 {
+			for _, ch := range p.Arena.ExtraSlice(n.Left, 3) {
+				collectSubtreeIdentCalls(p, ast.NodeID(ch), visited, decl)
+			}
+		} else {
+			// Skip n.Left of nested let bindings (collected under their own declaration),
+			// and continue walking n.Right (`in` body).
+			collectSubtreeIdentCalls(p, ast.NodeID(n.Right), visited, decl)
+		}
+	case ast.KindIf:
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Left), visited, decl)
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Right), visited, decl)
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Data), visited, decl)
+	case ast.KindMatchArm:
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Data), visited, decl)
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Right), visited, decl)
+	default:
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Left), visited, decl)
+		collectSubtreeIdentCalls(p, ast.NodeID(n.Right), visited, decl)
+	}
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {

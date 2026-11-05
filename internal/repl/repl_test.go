@@ -429,4 +429,45 @@ func TestLSPCodeLensAndFoldingRanges(t *testing.T) {
 	}
 }
 
+func TestLSPCallHierarchy(t *testing.T) {
+	doc := strings.Join([]string{
+		"let sanitize x = x + 1",
+		"let validate x = x * 2",
+		"let compute x = (sanitize x) + (validate x)",
+		"let runPipeline n = compute (compute n)",
+	}, "\n") + "\n"
+
+	computeItemJSON := `{"name":"compute","kind":12,"uri":"file:///calls.fml","range":{"start":{"line":2,"character":4},"end":{"line":2,"character":43}},"selectionRange":{"start":{"line":2,"character":4},"end":{"line":2,"character":11}}}`
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///calls.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/prepareCallHierarchy","params":{"textDocument":{"uri":"file:///calls.fml"},"position":{"line":2,"character":6}}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"callHierarchy/incomingCalls","params":{"item":%s}}`, computeItemJSON),
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":4,"method":"callHierarchy/outgoingCalls","params":{"item":%s}}`, computeItemJSON),
+		`{"jsonrpc":"2.0","id":5,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"callHierarchyProvider":true`,
+		`"name":"compute","kind":12,"detail":"(int -> int)"`,
+		`"from":{"name":"runPipeline","kind":12`,
+		`"to":{"name":"sanitize","kind":12`,
+		`"to":{"name":"validate","kind":12`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in callHierarchy response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
 
