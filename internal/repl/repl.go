@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"fml/internal/ast"
 	"fml/internal/codegen"
@@ -84,7 +85,11 @@ func (s *Session) EvalLine(line string) (string, error) {
 
 	switch {
 	case trimmed == ":help" || trimmed == ":h":
-		return "Commands:\n  :type <expr>   Inspect inferred Hindley-Milner type (with Units of Measure)\n  :ir <expr>     Disassemble lowered 10-opcode Lambda IR\n  :quote <expr>  Reify and format first-class AST quotation <@ expr @>\n  :fmt <expr>    Pretty-print FML source via Wadler layout engine\n  :quit          Exit the REPL", nil
+		return "Commands:\n  :type <expr>   Inspect inferred Hindley-Milner type (with Units of Measure)\n  :ir <expr>     Disassemble lowered 10-opcode Lambda IR\n  :quote <expr>  Reify and format first-class AST quotation <@ expr @>\n  :fmt <expr>    Pretty-print FML source via Wadler layout engine\n  :bench <expr>  Micro-benchmark expression (ns/op, steps/op, allocs/op)\n  :quit          Exit the REPL", nil
+
+	case strings.HasPrefix(trimmed, ":bench "):
+		expr := strings.TrimSpace(strings.TrimPrefix(trimmed, ":bench "))
+		return s.benchExpr(expr)
 
 	case strings.HasPrefix(trimmed, ":fmt "):
 		expr := strings.TrimSpace(strings.TrimPrefix(trimmed, ":fmt "))
@@ -179,6 +184,141 @@ func (s *Session) inspectIR(expr string) (string, error) {
 	}
 	prog := ir.Lower(p.Arena, chk.Types, root)
 	return strings.TrimRight(codegen.Disassemble(prog), "\n"), nil
+}
+
+func calibrateAndRunBench(vm *runtime.VM, runOnce func() error) (iters int, nsPerOp int64, stepsPerOp int64, allocsPerOp int64, err error) {
+	iters = 1
+	for iters < 2048 {
+		vm.Steps = 0
+		vm.Allocs = 0
+		start := time.Now()
+		for i := 0; i < iters; i++ {
+			if err := runOnce(); err != nil {
+				return 0, 0, 0, 0, err
+			}
+		}
+		elapsed := time.Since(start)
+		if elapsed >= 2*time.Millisecond || iters >= 2048 {
+			nsPerOp = elapsed.Nanoseconds() / int64(iters)
+			stepsPerOp = vm.Steps / int64(iters)
+			allocsPerOp = vm.Allocs / int64(iters)
+			return iters, nsPerOp, stepsPerOp, allocsPerOp, nil
+		}
+		iters *= 2
+	}
+	vm.Steps = 0
+	vm.Allocs = 0
+	start := time.Now()
+	for i := 0; i < iters; i++ {
+		if err := runOnce(); err != nil {
+			return 0, 0, 0, 0, err
+		}
+	}
+	elapsed := time.Since(start)
+	nsPerOp = elapsed.Nanoseconds() / int64(iters)
+	stepsPerOp = vm.Steps / int64(iters)
+	allocsPerOp = vm.Allocs / int64(iters)
+	return iters, nsPerOp, stepsPerOp, allocsPerOp, nil
+}
+
+func (s *Session) benchExpr(expr string) (string, error) {
+	fullSrc := s.buildSource("let __bench_target () = (" + expr + ")")
+	p, root, err := parser.ParseSource([]byte(fullSrc), nil)
+	if err != nil {
+		return "", err
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	chk.AttachSource(p.Source(), p.Tokens())
+	if _, err := chk.Infer(root); err != nil {
+		return "", err
+	}
+	prog := ir.Lower(p.Arena, chk.Types, root)
+	ir.Optimize(prog)
+	vm := runtime.NewVM(prog)
+	vm.Stdout = io.Discard
+	stdlib.RegisterAll(vm)
+	if _, err := vm.Run(); err != nil {
+		return "", err
+	}
+	targetSym := prog.Strings.InternString("__bench_target")
+	fnVal, ok := vm.Globals[targetSym]
+	if !ok {
+		return "", fmt.Errorf("failed to bind benchmark target")
+	}
+	iters, nsPerOp, stepsPerOp, allocsPerOp, err := calibrateAndRunBench(vm, func() error {
+		_, callErr := vm.Apply(fnVal, runtime.Unit)
+		return callErr
+	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("bench %s : %d iterations, %d ns/op, %d steps/op, %d allocs/op",
+		expr, iters, nsPerOp, stepsPerOp, allocsPerOp), nil
+}
+
+// BenchFile discovers and executes all top-level `let bench_*` bindings in path,
+// writing formatted micro-benchmark results (iterations, ns/op, steps/op, allocs/op) to out.
+func BenchFile(path string, out io.Writer) (int, error) {
+	p, root, err := parser.ParseFile(path, nil)
+	if err != nil {
+		return 0, err
+	}
+	var benchNames []string
+	progNode := p.Arena.Get(root)
+	for _, chID := range p.Arena.ExtraSlice(progNode.Left, progNode.Right) {
+		n := p.Arena.Get(ast.NodeID(chID))
+		if n.Kind == ast.KindLet || n.Kind == ast.KindLetRec {
+			name := p.Arena.Strings.String(token.StringID(n.Data))
+			if strings.HasPrefix(name, "bench_") {
+				benchNames = append(benchNames, name)
+			}
+		}
+	}
+	if len(benchNames) == 0 {
+		return 0, nil
+	}
+
+	prog, err := codegen.CompileFile(path)
+	if err != nil {
+		return 0, err
+	}
+	vm := runtime.NewVM(prog)
+	vm.Stdout = io.Discard
+	stdlib.RegisterAll(vm)
+	if _, err := vm.Run(); err != nil {
+		return 0, err
+	}
+
+	ran := 0
+	for _, bName := range benchNames {
+		sym := prog.Strings.InternString(bName)
+		val, ok := vm.Globals[sym]
+		if !ok {
+			continue
+		}
+		val = runtime.Deref(val)
+		var runOnce func() error
+		switch val.(type) {
+		case *runtime.ClosureVal, *runtime.BuiltinVal:
+			runOnce = func() error {
+				_, callErr := vm.Apply(val, runtime.Unit)
+				return callErr
+			}
+		default:
+			runOnce = func() error {
+				_, runErr := vm.Run()
+				return runErr
+			}
+		}
+		iters, nsPerOp, stepsPerOp, allocsPerOp, err := calibrateAndRunBench(vm, runOnce)
+		if err != nil {
+			return ran, fmt.Errorf("%s::%s: %w", path, bName, err)
+		}
+		fmt.Fprintf(out, "BENCH\t%s::%s\t%d\t%d ns/op\t%d steps/op\t%d allocs/op\n",
+			path, bName, iters, nsPerOp, stepsPerOp, allocsPerOp)
+		ran++
+	}
+	return ran, nil
 }
 
 func (s *Session) buildSource(current string) string {

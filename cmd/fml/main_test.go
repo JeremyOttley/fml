@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"fml/internal/repl"
 	"fml/internal/runtime"
 )
 
@@ -456,6 +457,42 @@ func TestCLIFmtWriteRecursiveTestAndDoc(t *testing.T) {
 	}
 }
 
+func TestBenchSuiteAndREPLBenchMetaCommand(t *testing.T) {
+	tmpDir := t.TempDir()
+	benchPath := filepath.Join(tmpDir, "list_bench.fml")
+	benchSrc := strings.Join([]string{
+		"let rec sumTo n acc =",
+		"    if n <= 0 then acc else sumTo (n - 1) (acc + n)",
+		"let bench_sumTo () = sumTo 50 0",
+		"let bench_listMap () = List.map (fun x -> x + 1) [1; 2; 3; 4]",
+	}, "\n") + "\n"
+	if err := os.WriteFile(benchPath, []byte(benchSrc), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
 
+	var benchOut bytes.Buffer
+	if err := runBenchSuite(tmpDir, &benchOut); err != nil {
+		t.Fatalf("runBenchSuite failed: %v", err)
+	}
+	for _, want := range []string{"BENCH\t", "bench_sumTo", "bench_listMap", "ns/op", "steps/op", "allocs/op", "ok\t2 benchmark(s) completed"} {
+		if !strings.Contains(benchOut.String(), want) {
+			t.Fatalf("expected %q in runBenchSuite output, got:\n%s", want, benchOut.String())
+		}
+	}
 
+	var replOut bytes.Buffer
+	sess := repl.NewSession(&replOut)
+	if _, err := sess.EvalLine("let double x = x * 2"); err != nil {
+		t.Fatalf("EvalLine let failed: %v", err)
+	}
+	bRes, err := sess.EvalLine(":bench double 21")
+	if err != nil {
+		t.Fatalf("EvalLine :bench failed: %v", err)
+	}
+	for _, want := range []string{"bench double 21 :", "iterations,", "ns/op,", "steps/op,", "allocs/op"} {
+		if !strings.Contains(bRes, want) {
+			t.Fatalf("expected %q in :bench output, got %q", want, bRes)
+		}
+	}
+}
 

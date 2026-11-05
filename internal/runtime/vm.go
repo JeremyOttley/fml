@@ -19,6 +19,8 @@ type VM struct {
 	Globals    map[token.StringID]Value
 	Stdout     io.Writer
 	CustomEval func(vm *VM, id ir.InstrID, env map[token.StringID]Value) (Value, error)
+	Steps      int64
+	Allocs     int64
 }
 
 // NewVM initializes a VM for prog with core built-in functions registered.
@@ -156,7 +158,11 @@ tcoLoop:
 		if id == ir.NoInstr || int(id) >= len(vm.Prog.Instrs) {
 			return Unit, nil
 		}
+		vm.Steps++
 		ins := vm.Prog.Instrs[id]
+		if ins.Kind == ir.IRAlloc || ins.Kind == ir.IRFn {
+			vm.Allocs++
+		}
 
 		switch ins.Kind {
 		case ir.IRConst:

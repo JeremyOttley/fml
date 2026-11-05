@@ -65,7 +65,7 @@ func ExecuteFile(path string, stdout io.Writer) (runtime.Value, error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: fml [run|build|emit-go|check|fmt|doc|lsp|test|repl] [file.fml] [-o <binary>]")
+		fmt.Fprintln(os.Stderr, "usage: fml [run|build|emit-go|check|fmt|doc|lsp|test|bench|repl] [file.fml] [-o <binary>]")
 		os.Exit(1)
 	}
 
@@ -77,6 +77,16 @@ func main() {
 		}
 		if err := runTestSuite(target, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "fml test failed: %v\n", err)
+			os.Exit(1)
+		}
+
+	case "bench":
+		target := "."
+		if len(os.Args) >= 3 {
+			target = os.Args[2]
+		}
+		if err := runBenchSuite(target, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "fml bench failed: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -245,6 +255,70 @@ func runTestSuite(target string, out io.Writer) error {
 	if len(files) > 0 {
 		fmt.Fprintf(out, "ok\t%d test file(s) passed\n", len(files))
 	}
+	return nil
+}
+
+func runBenchSuite(target string, out io.Writer) error {
+	recursive := false
+	cleanTarget := target
+	if cleanTarget == "./..." || cleanTarget == "..." {
+		recursive = true
+		cleanTarget = "."
+	} else if strings.HasSuffix(cleanTarget, "/...") {
+		recursive = true
+		cleanTarget = strings.TrimSuffix(cleanTarget, "/...")
+		if cleanTarget == "" {
+			cleanTarget = "."
+		}
+	}
+
+	info, err := os.Stat(cleanTarget)
+	if err != nil {
+		return err
+	}
+	var files []string
+	if !info.IsDir() {
+		files = append(files, cleanTarget)
+	} else if recursive {
+		err = filepath.WalkDir(cleanTarget, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.IsDir() {
+				if d.Name() != "." && strings.HasPrefix(d.Name(), ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if strings.HasSuffix(d.Name(), ".fml") {
+				files = append(files, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		entries, err := os.ReadDir(cleanTarget)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".fml") {
+				files = append(files, filepath.Join(cleanTarget, e.Name()))
+			}
+		}
+	}
+	sort.Strings(files)
+	totalRan := 0
+	for _, f := range files {
+		ran, err := repl.BenchFile(f, out)
+		if err != nil {
+			return err
+		}
+		totalRan += ran
+	}
+	fmt.Fprintf(out, "ok\t%d benchmark(s) completed\n", totalRan)
 	return nil
 }
 

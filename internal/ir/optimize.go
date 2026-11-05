@@ -2,6 +2,7 @@ package ir
 
 import (
 	"math"
+	"strings"
 
 	"fml/internal/token"
 )
@@ -425,6 +426,18 @@ func computeLiveSymbolUses(prog *Program) map[token.StringID]int {
 	uses := make(map[token.StringID]int)
 	visited := make(map[InstrID]bool)
 	markReachableUses(prog, prog.Root, uses, visited)
+	if prog.Strings != nil {
+		for _, ins := range prog.Instrs {
+			if ins.Kind == IRLet && ins.Data != 0 {
+				sym := token.StringID(ins.Data)
+				name := prog.Strings.String(sym)
+				if strings.HasPrefix(name, "bench_") || strings.HasPrefix(name, "test_") {
+					uses[sym]++
+					markReachableUses(prog, InstrID(ins.Arg0), uses, visited)
+				}
+			}
+		}
+	}
 	return uses
 }
 
