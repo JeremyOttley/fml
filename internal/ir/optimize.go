@@ -188,55 +188,205 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInst
 		}
 	}
 
-	argIns := prog.Instrs[appIns.Arg1]
-	if argIns.Kind != IRConst {
+	// Unwind curried application spine `f arg0 arg1 ...` (including desugared `|>` pipelines).
+	var revArgs []InstrID
+	currApp := appIns
+	var headIns IRInstr
+	for len(revArgs) < 8 {
+		if int(currApp.Arg0) >= len(prog.Instrs) || int(currApp.Arg1) >= len(prog.Instrs) {
+			return IRInstr{}, false
+		}
+		revArgs = append(revArgs, InstrID(currApp.Arg1))
+		nextIns := prog.Instrs[currApp.Arg0]
+		if nextIns.Kind == IRApp {
+			currApp = nextIns
+			continue
+		}
+		headIns = nextIns
+		break
+	}
+	if len(revArgs) == 0 {
 		return IRInstr{}, false
 	}
 
-	if fnIns.Kind == IRVar {
-		lookedUp, ok := fnEnv[token.StringID(fnIns.Data)]
+	if headIns.Kind == IRVar {
+		lookedUp, ok := fnEnv[token.StringID(headIns.Data)]
 		if !ok {
 			return IRInstr{}, false
 		}
-		fnIns = lookedUp
+		headIns = lookedUp
 	}
-	if fnIns.Kind != IRFn {
+	if headIns.Kind != IRFn {
 		return IRInstr{}, false
 	}
 
-	param := token.StringID(fnIns.Data)
-	if param == token.NoString || unsafeSyms[param] || int(fnIns.Arg0) >= len(prog.Instrs) {
+	argIDs := make([]InstrID, len(revArgs))
+	for i := range revArgs {
+		argIDs[i] = revArgs[len(revArgs)-1-i]
+	}
+
+	paramToArg := make(map[token.StringID]InstrID, len(argIDs))
+	currFn := headIns
+	var bodyID InstrID
+	for idx, argID := range argIDs {
+		if currFn.Kind != IRFn {
+			return IRInstr{}, false
+		}
+		param := token.StringID(currFn.Data)
+		if param == token.NoString || int(currFn.Arg0) >= len(prog.Instrs) {
+			return IRInstr{}, false
+		}
+		if _, dup := paramToArg[param]; dup {
+			return IRInstr{}, false
+		}
+		if !isPureExpr(prog, prog.Instrs[argID], unsafeSyms) {
+			return IRInstr{}, false
+		}
+		paramToArg[param] = argID
+		bodyID = InstrID(currFn.Arg0)
+		if idx+1 < len(argIDs) {
+			currFn = prog.Instrs[bodyID]
+		}
+	}
+
+	bodyIns := prog.Instrs[bodyID]
+	if bodyIns.Kind == IRFn {
+		// Partial application; wait for outer spine to supply remaining arguments.
 		return IRInstr{}, false
 	}
-	bodyIns := prog.Instrs[fnIns.Arg0]
+
+	paramUses := make(map[token.StringID]int, len(paramToArg))
+	markReachableUses(prog, bodyID, paramUses, make(map[InstrID]bool))
+	allConstArgs := true
+	maxParamUses := 0
+	for param, argID := range paramToArg {
+		uses := paramUses[param]
+		if uses > maxParamUses {
+			maxParamUses = uses
+		}
+		argIns := prog.Instrs[argID]
+		if argIns.Kind != IRConst {
+			allConstArgs = false
+		}
+		if uses > 1 && argIns.Kind != IRConst && argIns.Kind != IRVar {
+			return IRInstr{}, false
+		}
+	}
 
 	switch bodyIns.Kind {
 	case IRConst:
 		return bodyIns, true
 	case IRVar:
-		if token.StringID(bodyIns.Data) == param {
-			return argIns, true
+		if argID, ok := paramToArg[token.StringID(bodyIns.Data)]; ok {
+			return prog.Instrs[argID], true
 		}
 		return bodyIns, true
 	case IRPrim:
-		if bodyIns.SubOp == PrimSeqBlock || int(bodyIns.Arg0) >= len(prog.Instrs) {
+		if bodyIns.SubOp == PrimSeqBlock || bodyIns.SubOp == PrimWhile || bodyIns.SubOp == PrimForIn || bodyIns.SubOp == PrimForTo || int(bodyIns.Arg0) >= len(prog.Instrs) {
 			return IRInstr{}, false
 		}
-		lhs := prog.Instrs[bodyIns.Arg0]
-		if lhs.Kind == IRVar && token.StringID(lhs.Data) == param {
-			lhs = argIns
-		}
+		origLhs := prog.Instrs[bodyIns.Arg0]
 		if bodyIns.SubOp == PrimNeg || bodyIns.SubOp == PrimNot {
-			return evalFoldedOperands(prog, bodyIns.SubOp, lhs, IRInstr{}, false)
+			if origLhs.Kind == IRConst || origLhs.Kind == IRVar {
+				arg0ID := InstrID(bodyIns.Arg0)
+				if origLhs.Kind == IRVar {
+					if mapped, ok := paramToArg[token.StringID(origLhs.Data)]; ok {
+						arg0ID = mapped
+					}
+				}
+				inlined := IRInstr{
+					Kind:  IRPrim,
+					SubOp: bodyIns.SubOp,
+					Arg0:  uint32(arg0ID),
+					Arg1:  uint32(NoInstr),
+				}
+				if folded, ok := tryFoldPrim(prog, inlined, unsafeSyms); ok {
+					return folded, true
+				}
+				return inlined, true
+			}
+			if allConstArgs && maxParamUses <= 1 {
+				return evalInlineConstExpr(prog, bodyID, paramToArg, 0)
+			}
+			return IRInstr{}, false
 		}
+
 		if bodyIns.Arg1 == uint32(NoInstr) || int(bodyIns.Arg1) >= len(prog.Instrs) {
 			return IRInstr{}, false
 		}
-		rhs := prog.Instrs[bodyIns.Arg1]
-		if rhs.Kind == IRVar && token.StringID(rhs.Data) == param {
-			rhs = argIns
+		origRhs := prog.Instrs[bodyIns.Arg1]
+		if !allConstArgs && (bodyIns.SubOp == PrimDiv || bodyIns.SubOp == PrimMod) {
+			return IRInstr{}, false
 		}
-		return evalFoldedOperands(prog, bodyIns.SubOp, lhs, rhs, true)
+		if (origLhs.Kind == IRConst || origLhs.Kind == IRVar) && (origRhs.Kind == IRConst || origRhs.Kind == IRVar) {
+			arg0ID := InstrID(bodyIns.Arg0)
+			if origLhs.Kind == IRVar {
+				if mapped, ok := paramToArg[token.StringID(origLhs.Data)]; ok {
+					arg0ID = mapped
+				}
+			}
+			arg1ID := InstrID(bodyIns.Arg1)
+			if origRhs.Kind == IRVar {
+				if mapped, ok := paramToArg[token.StringID(origRhs.Data)]; ok {
+					arg1ID = mapped
+				}
+			}
+			inlined := IRInstr{
+				Kind:  IRPrim,
+				SubOp: bodyIns.SubOp,
+				Arg0:  uint32(arg0ID),
+				Arg1:  uint32(arg1ID),
+				Data:  bodyIns.Data,
+				Aux:   bodyIns.Aux,
+			}
+			if folded, ok := tryFoldPrim(prog, inlined, unsafeSyms); ok {
+				return folded, true
+			}
+			return inlined, true
+		}
+
+		if allConstArgs && maxParamUses <= 1 {
+			return evalInlineConstExpr(prog, bodyID, paramToArg, 0)
+		}
+	}
+	return IRInstr{}, false
+}
+
+func evalInlineConstExpr(prog *Program, id InstrID, paramToArg map[token.StringID]InstrID, depth int) (IRInstr, bool) {
+	if depth > 4 || id == NoInstr || int(id) >= len(prog.Instrs) {
+		return IRInstr{}, false
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case IRConst:
+		return ins, true
+	case IRVar:
+		if argID, ok := paramToArg[token.StringID(ins.Data)]; ok && int(argID) < len(prog.Instrs) {
+			argIns := prog.Instrs[argID]
+			if argIns.Kind == IRConst {
+				return argIns, true
+			}
+		}
+		return IRInstr{}, false
+	case IRPrim:
+		if ins.SubOp == PrimSeqBlock || int(ins.Arg0) >= len(prog.Instrs) {
+			return IRInstr{}, false
+		}
+		lhs, ok := evalInlineConstExpr(prog, InstrID(ins.Arg0), paramToArg, depth+1)
+		if !ok {
+			return IRInstr{}, false
+		}
+		if ins.SubOp == PrimNeg || ins.SubOp == PrimNot {
+			return evalFoldedOperands(prog, ins.SubOp, lhs, IRInstr{}, false)
+		}
+		if ins.Arg1 == uint32(NoInstr) || int(ins.Arg1) >= len(prog.Instrs) {
+			return IRInstr{}, false
+		}
+		rhs, ok := evalInlineConstExpr(prog, InstrID(ins.Arg1), paramToArg, depth+1)
+		if !ok {
+			return IRInstr{}, false
+		}
+		return evalFoldedOperands(prog, ins.SubOp, lhs, rhs, true)
 	}
 	return IRInstr{}, false
 }

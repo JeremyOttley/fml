@@ -136,5 +136,66 @@ ep.Port + extracted + tupVal + (fst pair) + (snd pair) + (id 16)
 	}
 }
 
+func TestMultiArgInliningAndPipelineFusion(t *testing.T) {
+	src := []byte(`
+let add a b = a + b
+let mul a b = a * b
+let mad a b c = a * b + c
+let step = add 5 >> mul 2
+
+let piped = 10 |> add 5 |> mul 2
+let composed = 10 |> step
+let fused3 = 4 |> mad 2 3
+
+piped + composed + fused3
+`)
+	p, root, err := parser.ParseSource(src, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	if _, err := chk.Infer(root); err != nil {
+		t.Fatalf("infer failed: %v", err)
+	}
+	prog := Lower(p.Arena, chk.Types, root)
+	Optimize(prog)
+
+	// piped = (5 + 10) * 2 = 30
+	// composed = (5 + 10) * 2 = 30
+	// fused3 = 2 * 3 + 4 = 10
+	// total = 70
+	rootInstr := prog.Instrs[prog.Root]
+	if rootInstr.Kind != IRConst || rootInstr.SubOp != ConstInt || int64(rootInstr.Data) != 70 {
+		t.Fatalf("expected multi-arg curried calls, pipelines, and compositions to fold into IRConst(70), got %+v", rootInstr)
+	}
+
+	// Verify non-constant pipeline stages inside a lambda fuse into direct IRPrim ops
+	srcFn := []byte(`
+let add a b = a + b
+let mul a b = a * b
+fun x -> x |> add 5 |> mul 2
+`)
+	p2, root2, err := parser.ParseSource(srcFn, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	chk2 := types.NewChecker(p2.Arena, nil)
+	if _, err := chk2.Infer(root2); err != nil {
+		t.Fatalf("infer failed: %v", err)
+	}
+	prog2 := Lower(p2.Arena, chk2.Types, root2)
+	Optimize(prog2)
+
+	fnInstr := prog2.Instrs[prog2.Root]
+	if fnInstr.Kind != IRFn {
+		t.Fatalf("expected root IRFn after DCE of inlined helpers, got %+v", fnInstr)
+	}
+	bodyInstr := prog2.Instrs[fnInstr.Arg0]
+	if bodyInstr.Kind != IRPrim || bodyInstr.SubOp != PrimMul {
+		t.Fatalf("expected pipeline body to fuse into IRPrim(PrimMul), got %+v", bodyInstr)
+	}
+}
+
+
 
 
