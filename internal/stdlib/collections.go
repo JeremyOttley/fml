@@ -329,6 +329,106 @@ func RegisterCollections(vm *runtime.VM) {
 			return runtime.SliceToList(out), nil
 		},
 	}
+	mapToList := &runtime.BuiltinVal{
+		Name:  "Map.toList",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[0]), &nodes)
+			out := make([]runtime.Value, len(nodes))
+			for i, n := range nodes {
+				out[i] = runtime.TupleVal{Elems: []runtime.Value{n.Key, n.Val}}
+			}
+			return runtime.SliceToList(out), nil
+		},
+	}
+	mapOfList := &runtime.BuiltinVal{
+		Name:  "Map.ofList",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			items := runtime.ListToSlice(runtime.Deref(args[0]))
+			var res *AVLNode
+			for _, elem := range items {
+				tv, ok := runtime.Deref(elem).(runtime.TupleVal)
+				if !ok || len(tv.Elems) < 2 {
+					return nil, fmt.Errorf("Map.ofList: expected (key, value) tuple, got %v", elem)
+				}
+				res = AVLInsert(res, runtime.Deref(tv.Elems[0]), runtime.Deref(tv.Elems[1]))
+			}
+			return wrapMap(res), nil
+		},
+	}
+	mapMap := &runtime.BuiltinVal{
+		Name:  "Map.map",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			fn := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var res *AVLNode
+			for _, n := range nodes {
+				partial, err := v.Apply(fn, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				mappedVal, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				res = AVLInsert(res, n.Key, runtime.Deref(mappedVal))
+			}
+			return wrapMap(res), nil
+		},
+	}
+	mapFilter := &runtime.BuiltinVal{
+		Name:  "Map.filter",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var res *AVLNode
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				keepVal, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(keepVal).(runtime.BoolVal); ok && bv.V {
+					res = AVLInsert(res, n.Key, n.Val)
+				}
+			}
+			return wrapMap(res), nil
+		},
+	}
+	mapFold := &runtime.BuiltinVal{
+		Name:  "Map.fold",
+		Arity: 3,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			folder := runtime.Deref(args[0])
+			state := runtime.Deref(args[1])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[2]), &nodes)
+			for _, n := range nodes {
+				p1, err := v.Apply(folder, state)
+				if err != nil {
+					return nil, err
+				}
+				p2, err := v.Apply(p1, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				state, err = v.Apply(p2, n.Val)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return state, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Map", map[string]runtime.Value{
 		"empty":       emptyMap,
@@ -340,6 +440,11 @@ func RegisterCollections(vm *runtime.VM) {
 		"count":       mapCount,
 		"keys":        mapKeys,
 		"values":      mapValues,
+		"toList":      mapToList,
+		"ofList":      mapOfList,
+		"map":         mapMap,
+		"filter":      mapFilter,
+		"fold":        mapFold,
 	})
 
 	emptySet := wrapSet(nil)
@@ -466,6 +571,65 @@ func RegisterCollections(vm *runtime.VM) {
 			return wrapSet(res), nil
 		},
 	}
+	setMap := &runtime.BuiltinVal{
+		Name:  "Set.map",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			fn := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var res *AVLNode
+			for _, n := range nodes {
+				mapped, err := v.Apply(fn, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res = AVLInsert(res, runtime.Deref(mapped), runtime.Unit)
+			}
+			return wrapSet(res), nil
+		},
+	}
+	setFilter := &runtime.BuiltinVal{
+		Name:  "Set.filter",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var res *AVLNode
+			for _, n := range nodes {
+				keep, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(keep).(runtime.BoolVal); ok && bv.V {
+					res = AVLInsert(res, n.Key, runtime.Unit)
+				}
+			}
+			return wrapSet(res), nil
+		},
+	}
+	setFold := &runtime.BuiltinVal{
+		Name:  "Set.fold",
+		Arity: 3,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			folder := runtime.Deref(args[0])
+			state := runtime.Deref(args[1])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[2]), &nodes)
+			for _, n := range nodes {
+				partial, err := v.Apply(folder, state)
+				if err != nil {
+					return nil, err
+				}
+				state, err = v.Apply(partial, n.Key)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return state, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Set", map[string]runtime.Value{
 		"empty":     emptySet,
@@ -479,6 +643,9 @@ func RegisterCollections(vm *runtime.VM) {
 		"isSubset":  setIsSubset,
 		"toList":    setToList,
 		"ofList":    setOfList,
+		"map":       setMap,
+		"filter":    setFilter,
+		"fold":      setFold,
 	})
 }
 

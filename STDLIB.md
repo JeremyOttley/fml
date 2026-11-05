@@ -63,6 +63,11 @@ printfn "%d" n
 | `Map.count` | `Map<'k, 'v> -> int` | Returns the total number of key-value pairs in the map. |
 | `Map.keys` | `Map<'k, 'v> -> 'k list` | Returns all keys in ascending order as a list. |
 | `Map.values` | `Map<'k, 'v> -> 'v list` | Returns all values ordered by ascending key as a list. |
+| `Map.toList` | `Map<'k, 'v> -> ('k * 'v) list` | Materializes all `(key, value)` pairs ordered by ascending key. |
+| `Map.ofList` | `('k * 'v) list -> Map<'k, 'v>` | Constructs a persistent map from a list of `(key, value)` pairs. |
+| `Map.map` | `('k -> 'v -> 'u) -> Map<'k, 'v> -> Map<'k, 'u>` | Transforms every value in the map using `(key, value)`. |
+| `Map.filter` | `('k -> 'v -> bool) -> Map<'k, 'v> -> Map<'k, 'v>` | Retains only `(key, value)` pairs satisfying the predicate. |
+| `Map.fold` | `('s -> 'k -> 'v -> 's) -> 's -> Map<'k, 'v> -> 's` | Folds over `(key, value)` pairs in ascending key order. |
 
 ### Example
 ```fsharp
@@ -104,6 +109,9 @@ let lookupUnknown =
 | `Set.isSubset` | `Set<'a> -> Set<'a> -> bool` | Returns `true` if every element of the first set is in the second set. |
 | `Set.toList` | `Set<'a> -> 'a list` | Materializes the set into a sorted ascending list. |
 | `Set.ofList` | `'a list -> Set<'a>` | Constructs a persistent ordered set from a list. |
+| `Set.map` | `('a -> 'b) -> Set<'a> -> Set<'b>` | Transforms each element into a new ordered set. |
+| `Set.filter` | `('a -> bool) -> Set<'a> -> Set<'a>` | Retains only elements satisfying the predicate. |
+| `Set.fold` | `('s -> 'a -> 's) -> 's -> Set<'a> -> 's` | Folds over set elements in ascending order. |
 
 ### Example
 ```fsharp

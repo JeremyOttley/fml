@@ -92,3 +92,31 @@ else
 	}
 }
 
+func TestMapAndSetHigherOrderCombinators(t *testing.T) {
+	src := `
+let m = Map.ofList [("a", 10); ("b", 20); ("c", 30)]
+let mDoubled = Map.map (fun _ v -> v * 2) m
+let mFiltered = Map.filter (fun _ v -> v > 20) mDoubled
+let mSum = Map.fold (fun acc _ v -> acc + v) 0 mFiltered
+let pairsLen =
+    match Map.toList mFiltered with
+    | [_; _] -> 2
+    | _ -> 0
+
+let s = Set.ofList [1; 2; 3; 4]
+let sMapped = Set.map (fun x -> x * 10) s
+let sFiltered = Set.filter (fun x -> x >= 20) sMapped
+let sSum = Set.fold (fun acc x -> acc + x) 0 sFiltered
+
+mSum + pairsLen + sSum
+`
+	res := runWithStdlib(t, src)
+	// mDoubled: a=20, b=40, c=60 -> mFiltered: b=40, c=60 -> mSum=100, pairsLen=2
+	// sMapped: 10, 20, 30, 40 -> sFiltered: 20, 30, 40 -> sSum=90
+	// Total = 100 + 2 + 90 = 192
+	if iv, ok := res.(runtime.IntVal); !ok || iv.V != 192 {
+		t.Fatalf("expected 192 from Map/Set higher-order combinators, got %v", res)
+	}
+}
+
+

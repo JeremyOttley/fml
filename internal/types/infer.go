@@ -244,6 +244,8 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Test.forall"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeString, arrow(listOf(a), arrow(arrow(a, TypeBool), TypeUnit)))}, false)
 
 	// Persistent Map combinators
+	kvStart, kvCount := c.Types.AddExtra([]TypeID{a, b})
+	kvPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: kvStart, Right: kvCount})
 	c.define(s.InternString("Map.empty"), TypeScheme{Vars: []TypeID{a, b}, Body: mapOf(a, b)}, false)
 	c.define(s.InternString("Map.add"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(a, arrow(b, arrow(mapOf(a, b), mapOf(a, b))))}, false)
 	c.define(s.InternString("Map.remove"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(a, arrow(mapOf(a, b), mapOf(a, b)))}, false)
@@ -253,6 +255,11 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Map.count"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(mapOf(a, b), TypeInt)}, false)
 	c.define(s.InternString("Map.keys"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(mapOf(a, b), listOf(a))}, false)
 	c.define(s.InternString("Map.values"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(mapOf(a, b), listOf(b))}, false)
+	c.define(s.InternString("Map.toList"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(mapOf(a, b), listOf(kvPairTy))}, false)
+	c.define(s.InternString("Map.ofList"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(listOf(kvPairTy), mapOf(a, b))}, false)
+	c.define(s.InternString("Map.map"), TypeScheme{Vars: []TypeID{a, b, e}, Body: arrow(arrow(a, arrow(b, e)), arrow(mapOf(a, b), mapOf(a, e)))}, false)
+	c.define(s.InternString("Map.filter"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, TypeBool)), arrow(mapOf(a, b), mapOf(a, b)))}, false)
+	c.define(s.InternString("Map.fold"), TypeScheme{Vars: []TypeID{a, b, e}, Body: arrow(arrow(e, arrow(a, arrow(b, e))), arrow(e, arrow(mapOf(a, b), e)))}, false)
 
 	// Persistent Set combinators
 	c.define(s.InternString("Set.empty"), TypeScheme{Vars: []TypeID{a}, Body: setOf(a)}, false)
@@ -266,6 +273,9 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Set.isSubset"), TypeScheme{Vars: []TypeID{a}, Body: arrow(setOf(a), arrow(setOf(a), TypeBool))}, false)
 	c.define(s.InternString("Set.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(setOf(a), listOf(a))}, false)
 	c.define(s.InternString("Set.ofList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), setOf(a))}, false)
+	c.define(s.InternString("Set.map"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(setOf(a), setOf(b)))}, false)
+	c.define(s.InternString("Set.filter"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(setOf(a), setOf(a)))}, false)
+	c.define(s.InternString("Set.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(setOf(b), a)))}, false)
 
 	// Regex combinators
 	c.define(s.InternString("Regex.isMatch"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeBool))}, false)
