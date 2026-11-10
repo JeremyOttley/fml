@@ -23,6 +23,30 @@ Seq.sum firstFive
 	}
 }
 
+func TestSeqExtendedCombinators(t *testing.T) {
+	src := `
+let base = Seq.initInfinite (fun i -> i + 1)
+let window = base |> Seq.skip 2 |> Seq.takeWhile (fun x -> x <= 6)
+let extra = Seq.ofList [10; 20]
+let combined = Seq.append window (Seq.append Seq.empty extra)
+let zipped = Seq.zip combined (Seq.initInfinite (fun i -> i + 1))
+let folded =
+    zipped
+    |> Seq.fold (fun acc pair -> acc + (fst pair) * (snd pair)) 0
+let materialized = Seq.toList combined
+folded + List.length materialized
+`
+	// window = [3; 4; 5; 6]
+	// combined = [3; 4; 5; 6; 10; 20] (length = 6)
+	// zipped with [1; 2; 3; 4; 5; 6]:
+	// 3*1 + 4*2 + 5*3 + 6*4 + 10*5 + 20*6 = 3 + 8 + 15 + 24 + 50 + 120 = 220
+	// folded + length = 220 + 6 = 226
+	res := evalFML(t, src)
+	if iv, ok := res.(runtime.IntVal); !ok || iv.V != 226 {
+		t.Fatalf("expected 226 from extended Seq combinators, got %v", res)
+	}
+}
+
 func TestFormat(t *testing.T) {
 	src := `
 let header = Format.text "begin"

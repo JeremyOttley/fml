@@ -165,6 +165,9 @@ func (c *Checker) registerCombinatorTypes() {
 	arrOf := func(elem TypeID) TypeID {
 		return c.Types.Add(TypeNode{Kind: TyArray, Left: uint32(elem)})
 	}
+	seqOf := func(elem TypeID) TypeID {
+		return c.Types.Add(TypeNode{Kind: TySeq, Left: uint32(elem)})
+	}
 	optOf := func(elem TypeID) TypeID {
 		return c.Types.Add(TypeNode{Kind: TyOption, Left: uint32(elem)})
 	}
@@ -219,6 +222,22 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Array.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(arrOf(b), a)))}, false)
 	c.define(s.InternString("Array.ofList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), arrOf(a))}, false)
 	c.define(s.InternString("Array.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), listOf(a))}, false)
+
+	// Seq combinators
+	c.define(s.InternString("Seq.empty"), TypeScheme{Vars: []TypeID{a}, Body: seqOf(a)}, false)
+	c.define(s.InternString("Seq.ofList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), seqOf(a))}, false)
+	c.define(s.InternString("Seq.init"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(arrow(TypeInt, a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.initInfinite"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(TypeInt, a), seqOf(a))}, false)
+	c.define(s.InternString("Seq.map"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(seqOf(a), seqOf(b)))}, false)
+	c.define(s.InternString("Seq.filter"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(seqOf(a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.take"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(seqOf(a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.skip"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(seqOf(a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.takeWhile"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(seqOf(a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.append"), TypeScheme{Vars: []TypeID{a}, Body: arrow(seqOf(a), arrow(seqOf(a), seqOf(a)))}, false)
+	c.define(s.InternString("Seq.zip"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(seqOf(a), arrow(seqOf(b), seqOf(zipPairTy)))}, false)
+	c.define(s.InternString("Seq.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(seqOf(b), a)))}, false)
+	c.define(s.InternString("Seq.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(seqOf(a), listOf(a))}, false)
+	c.define(s.InternString("Seq.sum"), TypeScheme{Vars: []TypeID{a}, Body: arrow(seqOf(a), a)}, false)
 
 	// String combinators
 	c.define(s.InternString("String.length"), TypeScheme{Body: arrow(TypeString, TypeInt)}, false)

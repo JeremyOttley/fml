@@ -160,6 +160,183 @@ func RegisterSeq(vm *runtime.VM) {
 		},
 	}
 
+	seqEmpty := wrapSeq(func() func() (runtime.Value, bool, error) {
+		return func() (runtime.Value, bool, error) {
+			return nil, false, nil
+		}
+	})
+
+	seqOfList := &runtime.BuiltinVal{
+		Name:  "Seq.ofList",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			srcIter, err := unwrapSeq(args[0])
+			if err != nil {
+				return nil, err
+			}
+			return wrapSeq(srcIter), nil
+		},
+	}
+
+	seqSkip := &runtime.BuiltinVal{
+		Name:  "Seq.skip",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			skipCount := runtime.Deref(args[0]).(runtime.IntVal).V
+			srcIter, err := unwrapSeq(args[1])
+			if err != nil {
+				return nil, err
+			}
+			return wrapSeq(func() func() (runtime.Value, bool, error) {
+				next := srcIter()
+				skipped := int64(0)
+				return func() (runtime.Value, bool, error) {
+					for skipped < skipCount {
+						skipped++
+						_, ok, err := next()
+						if !ok || err != nil {
+							return nil, ok, err
+						}
+					}
+					return next()
+				}
+			}), nil
+		},
+	}
+
+	seqTakeWhile := &runtime.BuiltinVal{
+		Name:  "Seq.takeWhile",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			srcIter, err := unwrapSeq(args[1])
+			if err != nil {
+				return nil, err
+			}
+			return wrapSeq(func() func() (runtime.Value, bool, error) {
+				next := srcIter()
+				done := false
+				return func() (runtime.Value, bool, error) {
+					if done {
+						return nil, false, nil
+					}
+					elem, ok, err := next()
+					if !ok || err != nil {
+						done = true
+						return nil, ok, err
+					}
+					keepVal, err := v.Apply(pred, elem)
+					if err != nil {
+						done = true
+						return nil, false, err
+					}
+					if bv, ok := runtime.Deref(keepVal).(runtime.BoolVal); ok && bv.V {
+						return elem, true, nil
+					}
+					done = true
+					return nil, false, nil
+				}
+			}), nil
+		},
+	}
+
+	seqAppend := &runtime.BuiltinVal{
+		Name:  "Seq.append",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			iterA, err := unwrapSeq(args[0])
+			if err != nil {
+				return nil, err
+			}
+			iterB, err := unwrapSeq(args[1])
+			if err != nil {
+				return nil, err
+			}
+			return wrapSeq(func() func() (runtime.Value, bool, error) {
+				nextA := iterA()
+				var nextB func() (runtime.Value, bool, error)
+				inB := false
+				return func() (runtime.Value, bool, error) {
+					if !inB {
+						elem, ok, err := nextA()
+						if err != nil {
+							return nil, false, err
+						}
+						if ok {
+							return elem, true, nil
+						}
+						inB = true
+						nextB = iterB()
+					}
+					return nextB()
+				}
+			}), nil
+		},
+	}
+
+	seqZip := &runtime.BuiltinVal{
+		Name:  "Seq.zip",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			iterA, err := unwrapSeq(args[0])
+			if err != nil {
+				return nil, err
+			}
+			iterB, err := unwrapSeq(args[1])
+			if err != nil {
+				return nil, err
+			}
+			return wrapSeq(func() func() (runtime.Value, bool, error) {
+				nextA := iterA()
+				nextB := iterB()
+				return func() (runtime.Value, bool, error) {
+					elemA, okA, errA := nextA()
+					if !okA || errA != nil {
+						return nil, okA, errA
+					}
+					elemB, okB, errB := nextB()
+					if !okB || errB != nil {
+						return nil, okB, errB
+					}
+					return runtime.TupleVal{Elems: []runtime.Value{runtime.Deref(elemA), runtime.Deref(elemB)}}, true, nil
+				}
+			}), nil
+		},
+	}
+
+	seqFold := &runtime.BuiltinVal{
+		Name:  "Seq.fold",
+		Arity: 3,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			folder := runtime.Deref(args[0])
+			state := runtime.Deref(args[1])
+			srcIter, err := unwrapSeq(args[2])
+			if err != nil {
+				return nil, err
+			}
+			next := srcIter()
+			for {
+				elem, ok, err := next()
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					break
+				}
+				partial, err := v.Apply(folder, state)
+				if err != nil {
+					return nil, err
+				}
+				state, err = v.Apply(partial, elem)
+				if err != nil {
+					return nil, err
+				}
+				state = runtime.Deref(state)
+			}
+			return state, nil
+		},
+	}
+
 	seqToList := &runtime.BuiltinVal{
 		Name:  "Seq.toList",
 		Arity: 1,
@@ -209,11 +386,18 @@ func RegisterSeq(vm *runtime.VM) {
 	}
 
 	defineModuleRecord(vm, "Seq", map[string]runtime.Value{
+		"empty":        seqEmpty,
+		"ofList":       seqOfList,
 		"init":         seqInit,
 		"initInfinite": seqInitInfinite,
 		"map":          seqMap,
 		"filter":       seqFilter,
 		"take":         seqTake,
+		"skip":         seqSkip,
+		"takeWhile":    seqTakeWhile,
+		"append":       seqAppend,
+		"zip":          seqZip,
+		"fold":         seqFold,
 		"toList":       seqToList,
 		"sum":          seqSum,
 	})
