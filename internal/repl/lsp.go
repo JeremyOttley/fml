@@ -1163,7 +1163,7 @@ func splitCallTokens(s string) []string {
 
 var missingADTRe = regexp.MustCompile(`missing constructor\(s\) \[([^\]]+)\]`)
 
-func (s *LSPServer) computeCodeActions(uri string, _ lspRange) []lspCodeAction {
+func (s *LSPServer) computeCodeActions(uri string, rng lspRange) []lspCodeAction {
 	text, ok := s.Docs[uri]
 	if !ok {
 		return nil
@@ -1175,78 +1175,76 @@ func (s *LSPServer) computeCodeActions(uri string, _ lspRange) []lspCodeAction {
 	chk := types.NewChecker(p.Arena, nil)
 	chk.AttachSource(p.Source(), p.Tokens())
 	_, err = chk.Infer(root)
-	if err == nil || !strings.Contains(err.Error(), "non-exhaustive") {
-		return nil
-	}
 
-	errMsg := err.Error()
-	var missingPats []string
+	var actions []lspCodeAction
+	if err != nil && strings.Contains(err.Error(), "non-exhaustive") {
+		errMsg := err.Error()
+		var missingPats []string
 
-	if m := missingADTRe.FindStringSubmatch(errMsg); len(m) == 2 {
-		names := strings.Fields(m[1])
-		sort.Strings(names)
-		for _, ctorName := range names {
-			cID := p.Arena.Strings.InternString(ctorName)
-			if info, hasCtor := chk.Constructors[cID]; hasCtor && info.Payload != types.NoType {
-				missingPats = append(missingPats, ctorName+" _")
-			} else {
-				missingPats = append(missingPats, ctorName)
-			}
-		}
-	} else if strings.Contains(errMsg, "non-exhaustive option match") {
-		if !strings.Contains(text, "| None") {
-			missingPats = append(missingPats, "None")
-		} else {
-			missingPats = append(missingPats, "Some _")
-		}
-	} else if strings.Contains(errMsg, "non-exhaustive Result match") {
-		if !strings.Contains(text, "| Error") {
-			missingPats = append(missingPats, "Error _")
-		} else {
-			missingPats = append(missingPats, "Ok _")
-		}
-	} else if strings.Contains(errMsg, "non-exhaustive boolean match") {
-		if !strings.Contains(text, "| false") {
-			missingPats = append(missingPats, "false")
-		} else {
-			missingPats = append(missingPats, "true")
-		}
-	} else {
-		missingPats = append(missingPats, "_")
-	}
-
-	lines := strings.Split(text, "\n")
-	insertLine := len(lines) - 1
-	indent := "    "
-	rhsDefault := "0"
-	for i := len(lines) - 1; i >= 0; i-- {
-		trimmed := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(trimmed, "|") {
-			insertLine = i + 1
-			leadLen := len(lines[i]) - len(strings.TrimLeft(lines[i], " \t"))
-			indent = lines[i][:leadLen]
-			if arrowIdx := strings.Index(trimmed, "->"); arrowIdx >= 0 {
-				rhsSample := strings.TrimSpace(trimmed[arrowIdx+2:])
-				if strings.HasPrefix(rhsSample, "\"") {
-					rhsDefault = "\"\""
-				} else if rhsSample == "true" || rhsSample == "false" {
-					rhsDefault = "false"
-				} else if strings.Contains(rhsSample, ".") {
-					rhsDefault = "0.0"
+		if m := missingADTRe.FindStringSubmatch(errMsg); len(m) == 2 {
+			names := strings.Fields(m[1])
+			sort.Strings(names)
+			for _, ctorName := range names {
+				cID := p.Arena.Strings.InternString(ctorName)
+				if info, hasCtor := chk.Constructors[cID]; hasCtor && info.Payload != types.NoType {
+					missingPats = append(missingPats, ctorName+" _")
+				} else {
+					missingPats = append(missingPats, ctorName)
 				}
 			}
-			break
+		} else if strings.Contains(errMsg, "non-exhaustive option match") {
+			if !strings.Contains(text, "| None") {
+				missingPats = append(missingPats, "None")
+			} else {
+				missingPats = append(missingPats, "Some _")
+			}
+		} else if strings.Contains(errMsg, "non-exhaustive Result match") {
+			if !strings.Contains(text, "| Error") {
+				missingPats = append(missingPats, "Error _")
+			} else {
+				missingPats = append(missingPats, "Ok _")
+			}
+		} else if strings.Contains(errMsg, "non-exhaustive boolean match") {
+			if !strings.Contains(text, "| false") {
+				missingPats = append(missingPats, "false")
+			} else {
+				missingPats = append(missingPats, "true")
+			}
+		} else {
+			missingPats = append(missingPats, "_")
 		}
-	}
 
-	var stub strings.Builder
-	for _, pat := range missingPats {
-		fmt.Fprintf(&stub, "%s| %s -> %s\n", indent, pat, rhsDefault)
-	}
+		lines := strings.Split(text, "\n")
+		insertLine := len(lines) - 1
+		indent := "    "
+		rhsDefault := "0"
+		for i := len(lines) - 1; i >= 0; i-- {
+			trimmed := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(trimmed, "|") {
+				insertLine = i + 1
+				leadLen := len(lines[i]) - len(strings.TrimLeft(lines[i], " \t"))
+				indent = lines[i][:leadLen]
+				if arrowIdx := strings.Index(trimmed, "->"); arrowIdx >= 0 {
+					rhsSample := strings.TrimSpace(trimmed[arrowIdx+2:])
+					if strings.HasPrefix(rhsSample, "\"") {
+						rhsDefault = "\"\""
+					} else if rhsSample == "true" || rhsSample == "false" {
+						rhsDefault = "false"
+					} else if strings.Contains(rhsSample, ".") {
+						rhsDefault = "0.0"
+					}
+				}
+				break
+			}
+		}
 
-	pos := lspPosition{Line: insertLine, Character: 0}
-	return []lspCodeAction{
-		{
+		var stub strings.Builder
+		for _, pat := range missingPats {
+			fmt.Fprintf(&stub, "%s| %s -> %s\n", indent, pat, rhsDefault)
+		}
+
+		pos := lspPosition{Line: insertLine, Character: 0}
+		actions = append(actions, lspCodeAction{
 			Title: fmt.Sprintf("Add missing match case(s): %s", strings.Join(missingPats, ", ")),
 			Kind:  "quickfix",
 			Edit: &lspWorkspaceEdit{
@@ -1259,8 +1257,162 @@ func (s *LSPServer) computeCodeActions(uri string, _ lspRange) []lspCodeAction {
 					},
 				},
 			},
-		},
+		})
 	}
+
+	toks := p.Tokens()
+	src := p.Source()
+	filterRange := rng.End.Line > 0 || rng.End.Character > 0
+
+	paramNodeIDs := make(map[ast.NodeID]bool)
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		if n.Kind == ast.KindLambda && ast.NodeID(n.Left) != ast.NoNode {
+			paramNodeIDs[ast.NodeID(n.Left)] = true
+		}
+	}
+
+	identUses := make(map[token.StringID]int)
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		if paramNodeIDs[ast.NodeID(id)] {
+			continue
+		}
+		n := p.Arena.Nodes[id]
+		if n.Kind == ast.KindIdent && n.Data != 0 {
+			identUses[token.StringID(n.Data)]++
+		}
+	}
+
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			if n.Op == 1 || n.Data == 0 {
+				continue
+			}
+			sym := token.StringID(n.Data)
+			symName := p.Arena.Strings.String(sym)
+			if symName == "" || strings.HasPrefix(symName, "_") {
+				continue
+			}
+			nameTokIdx := -1
+			startIdx := int(n.TokenIdx)
+			for i := startIdx; i < len(toks) && i <= startIdx+5; i++ {
+				if string(toks[i].Slice(src)) == symName {
+					nameTokIdx = i
+					break
+				}
+			}
+			if nameTokIdx < 0 {
+				continue
+			}
+			tk := toks[nameTokIdx]
+			declLine := max(0, int(tk.Line)-1)
+			if filterRange && (declLine < rng.Start.Line || declLine > rng.End.Line) {
+				continue
+			}
+
+			// 1. Add explicit type annotation refactor action
+			if id < len(chk.NodeTypes) && chk.NodeTypes[id] != types.NoType {
+				lhsID := ast.NodeID(n.Left)
+				if lhsID != ast.NoNode && p.Arena.Get(lhsID).Kind == ast.KindLambda {
+					var paramEdits []lspTextEdit
+					currLam := lhsID
+					currTy := chk.Types.Find(chk.NodeTypes[id])
+					for currLam != ast.NoNode && int(currLam) < len(p.Arena.Nodes) {
+						ln := p.Arena.Get(currLam)
+						if ln.Kind != ast.KindLambda {
+							break
+						}
+						if int(currTy) >= len(chk.Types.Nodes) || chk.Types.Nodes[currTy].Kind != types.TyArrow {
+							break
+						}
+						paramTy := chk.Types.Find(types.TypeID(chk.Types.Nodes[currTy].Left))
+						currTy = chk.Types.Find(types.TypeID(chk.Types.Nodes[currTy].Right))
+						paramID := ast.NodeID(ln.Left)
+						if paramID != ast.NoNode {
+							pn := p.Arena.Get(paramID)
+							pIdx := int(pn.TokenIdx)
+							if pn.Kind == ast.KindIdent && pIdx >= 0 && pIdx < len(toks) {
+								pName := p.Arena.Strings.String(token.StringID(pn.Data))
+								pTyStr := chk.Types.Format(paramTy)
+								if pName != "" && pName != "_" && !strings.HasPrefix(pName, "__") && !strings.Contains(pTyStr, "'t") {
+									if pIdx+1 >= len(toks) || toks[pIdx+1].Kind != token.TokenColon {
+										ptk := toks[pIdx]
+										pLine := max(0, int(ptk.Line)-1)
+										pCol := max(0, int(ptk.Col)-1)
+										pLen := max(len(pName), int(ptk.End-ptk.Start))
+										paramEdits = append(paramEdits, lspTextEdit{
+											Range: lspRange{
+												Start: lspPosition{Line: pLine, Character: pCol},
+												End:   lspPosition{Line: pLine, Character: pCol + pLen},
+											},
+											NewText: fmt.Sprintf("(%s: %s)", pName, pTyStr),
+										})
+									}
+								}
+							}
+						}
+						currLam = ast.NodeID(ln.Right)
+					}
+					if len(paramEdits) > 0 {
+						actions = append(actions, lspCodeAction{
+							Title: fmt.Sprintf("Add explicit type annotations to '%s'", symName),
+							Kind:  "refactor.rewrite",
+							Edit: &lspWorkspaceEdit{
+								Changes: map[string][]lspTextEdit{
+									uri: paramEdits,
+								},
+							},
+						})
+					}
+				} else if lhsID != ast.NoNode && p.Arena.Get(lhsID).Kind != ast.KindTypeAnnot {
+					tyStr := chk.Types.Format(chk.NodeTypes[id])
+					if nameTokIdx+1 < len(toks) && toks[nameTokIdx+1].Kind != token.TokenColon && !strings.Contains(tyStr, "'t") {
+						spanLen := max(len(symName), int(tk.End-tk.Start))
+						pos := lspPosition{
+							Line:      declLine,
+							Character: max(0, int(tk.Col)-1) + spanLen,
+						}
+						actions = append(actions, lspCodeAction{
+							Title: fmt.Sprintf("Add explicit type annotation ': %s' to '%s'", tyStr, symName),
+							Kind:  "refactor.rewrite",
+							Edit: &lspWorkspaceEdit{
+								Changes: map[string][]lspTextEdit{
+									uri: {
+										{
+											Range:   lspRange{Start: pos, End: pos},
+											NewText: ": " + tyStr,
+										},
+									},
+								},
+							},
+						})
+					}
+				}
+			}
+
+			// 2. Prefix unused binding with '_' quickfix
+			if identUses[sym] == 0 && !strings.HasPrefix(symName, "test_") && !strings.HasPrefix(symName, "bench_") {
+				actions = append(actions, lspCodeAction{
+					Title: fmt.Sprintf("Prefix unused binding '%s' with '_'", symName),
+					Kind:  "quickfix",
+					Edit: &lspWorkspaceEdit{
+						Changes: map[string][]lspTextEdit{
+							uri: {
+								{
+									Range:   tokenRangeForDecl(p, int(n.TokenIdx), symName),
+									NewText: "_" + symName,
+								},
+							},
+						},
+					},
+				})
+			}
+		}
+	}
+
+	return actions
 }
 
 func (s *LSPServer) computeInlayHints(uri string, rng lspRange) []lspInlayHint {

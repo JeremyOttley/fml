@@ -469,5 +469,43 @@ func TestLSPCallHierarchy(t *testing.T) {
 	}
 }
 
+func TestLSPTypeAnnotationAndUnusedBindingCodeActions(t *testing.T) {
+	doc := strings.Join([]string{
+		"let scale factor x = (factor * x) % 100",
+		"let base = 42",
+		"let unusedTemp = scale 2 base",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///refactor.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///refactor.fml"},"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":30}}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"title":"Add explicit type annotations to 'scale'"`,
+		`"kind":"refactor.rewrite"`,
+		`"newText":"(factor: int)"`,
+		`"newText":"(x: int)"`,
+		`"title":"Add explicit type annotation ': int' to 'base'"`,
+		`"newText":": int"`,
+		`"title":"Prefix unused binding 'unusedTemp' with '_'"`,
+		`"newText":"_unusedTemp"`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in codeAction response, got:\n%s", exp, resp)
+		}
+	}
+}
+
 
 
