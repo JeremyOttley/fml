@@ -707,6 +707,8 @@ func registerStringModule(vm *runtime.VM) {
 func registerOptionModule(vm *runtime.VM) {
 	someID := vm.Prog.Strings.InternString("Some")
 	noneID := vm.Prog.Strings.InternString("None")
+	okID := vm.Prog.Strings.InternString("Ok")
+	errID := vm.Prog.Strings.InternString("Error")
 
 	optIsSome := &runtime.BuiltinVal{
 		Name:  "Option.isSome",
@@ -764,6 +766,61 @@ func registerOptionModule(vm *runtime.VM) {
 			return vm.Apply(fn, runtime.Deref(adt.Payload))
 		},
 	}
+	optFilter := &runtime.BuiltinVal{
+		Name:  "Option.filter",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			adt, ok := runtime.Deref(args[1]).(runtime.ADTVal)
+			if !ok || adt.Tag == noneID || adt.TagName == "None" {
+				return runtime.ADTVal{Tag: noneID, TagName: "None"}, nil
+			}
+			payload := runtime.Deref(adt.Payload)
+			keep, err := vm.Apply(pred, payload)
+			if err != nil {
+				return nil, err
+			}
+			if bv, ok := runtime.Deref(keep).(runtime.BoolVal); ok && bv.V {
+				return adt, nil
+			}
+			return runtime.ADTVal{Tag: noneID, TagName: "None"}, nil
+		},
+	}
+	optOrElse := &runtime.BuiltinVal{
+		Name:  "Option.orElse",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			fallback := runtime.Deref(args[0])
+			adt, ok := runtime.Deref(args[1]).(runtime.ADTVal)
+			if !ok || adt.Tag == noneID || adt.TagName == "None" {
+				return fallback, nil
+			}
+			return adt, nil
+		},
+	}
+	optToList := &runtime.BuiltinVal{
+		Name:  "Option.toList",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			adt, ok := runtime.Deref(args[0]).(runtime.ADTVal)
+			if !ok || adt.Tag == noneID || adt.TagName == "None" {
+				return runtime.EmptyList, nil
+			}
+			return runtime.SliceToList([]runtime.Value{runtime.Deref(adt.Payload)}), nil
+		},
+	}
+	optToResult := &runtime.BuiltinVal{
+		Name:  "Option.toResult",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			errVal := runtime.Deref(args[0])
+			adt, ok := runtime.Deref(args[1]).(runtime.ADTVal)
+			if !ok || adt.Tag == noneID || adt.TagName == "None" {
+				return runtime.ADTVal{Tag: errID, TagName: "Error", Payload: errVal}, nil
+			}
+			return runtime.ADTVal{Tag: okID, TagName: "Ok", Payload: runtime.Deref(adt.Payload)}, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Option", map[string]runtime.Value{
 		"isSome":       optIsSome,
@@ -771,12 +828,18 @@ func registerOptionModule(vm *runtime.VM) {
 		"defaultValue": optDefaultValue,
 		"map":          optMap,
 		"bind":         optBind,
+		"filter":       optFilter,
+		"orElse":       optOrElse,
+		"toList":       optToList,
+		"toResult":     optToResult,
 	})
 }
 
 func registerResultModule(vm *runtime.VM) {
 	okID := vm.Prog.Strings.InternString("Ok")
 	errID := vm.Prog.Strings.InternString("Error")
+	someID := vm.Prog.Strings.InternString("Some")
+	noneID := vm.Prog.Strings.InternString("None")
 
 	resIsOk := &runtime.BuiltinVal{
 		Name:  "Result.isOk",
@@ -850,6 +913,29 @@ func registerResultModule(vm *runtime.VM) {
 			return vm.Apply(fn, runtime.Deref(adt.Payload))
 		},
 	}
+	resToOption := &runtime.BuiltinVal{
+		Name:  "Result.toOption",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			adt, ok := runtime.Deref(args[0]).(runtime.ADTVal)
+			if !ok || adt.Tag == errID || adt.TagName == "Error" {
+				return runtime.ADTVal{Tag: noneID, TagName: "None"}, nil
+			}
+			return runtime.ADTVal{Tag: someID, TagName: "Some", Payload: runtime.Deref(adt.Payload)}, nil
+		},
+	}
+	resOrElse := &runtime.BuiltinVal{
+		Name:  "Result.orElse",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			fallback := runtime.Deref(args[0])
+			adt, ok := runtime.Deref(args[1]).(runtime.ADTVal)
+			if !ok || adt.Tag == errID || adt.TagName == "Error" {
+				return fallback, nil
+			}
+			return adt, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Result", map[string]runtime.Value{
 		"isOk":         resIsOk,
@@ -858,6 +944,8 @@ func registerResultModule(vm *runtime.VM) {
 		"map":          resMap,
 		"mapError":     resMapError,
 		"bind":         resBind,
+		"toOption":     resToOption,
+		"orElse":       resOrElse,
 	})
 }
 

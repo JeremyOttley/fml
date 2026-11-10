@@ -259,4 +259,24 @@ else
 	}
 }
 
+func TestOptionAndResultExtendedCombinators(t *testing.T) {
+	src := `
+let opt1 = Some 10 |> Option.filter (fun x -> x > 5)
+let opt2 = Some 3 |> Option.filter (fun x -> x > 5) |> Option.orElse (Some 20)
+let optList = Option.toList opt1
+let res1 = opt2 |> Option.toResult "missing"
+let res2 = None |> Option.toResult "missing" |> Result.orElse (Ok 30)
+let backOpt = Result.toOption res2
+let v1 = Option.defaultValue 0 opt1
+let v2 = Result.defaultValue 0 res1
+let v3 = Option.defaultValue 0 backOpt
+v1 + v2 + v3 + List.sum optList
+`
+	val := evalFML(t, src)
+	// v1 = 10, v2 = 20, v3 = 30, List.sum optList = 10 -> 70
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 70 {
+		t.Fatalf("expected 70 from extended Option/Result combinators, got %v", val)
+	}
+}
+
 

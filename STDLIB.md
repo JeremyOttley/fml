@@ -341,8 +341,8 @@ First-class code quotations `<@ expr @>` reify FML expressions into the built-in
 | `List` | `List.empty`, `List.isEmpty`, `List.length`, `List.head`, `List.tail`, `List.rev`, `List.map`, `List.filter`, `List.fold`, `List.sortBy`, `List.sum`, `List.tryFind`, `List.exists`, `List.forall`, `List.zip`, `List.partition`, `List.choose`, `List.collect` |
 | `Array` | `Array.length`, `Array.get`, `Array.set`, `Array.map`, `Array.filter`, `Array.fold`, `Array.ofList`, `Array.toList` |
 | `String` | `String.length`, `String.trim`, `String.split`, `String.join`, `String.contains`, `String.toUpper`, `String.toLower`, `String.startsWith`, `String.endsWith`, `String.replace`, `String.indexOf`, `String.substring` |
-| `Option` | `Option.isSome`, `Option.isNone`, `Option.defaultValue`, `Option.map`, `Option.bind` |
-| `Result` | `Result.isOk`, `Result.isError`, `Result.defaultValue`, `Result.map`, `Result.mapError`, `Result.bind` |
+| `Option` | `Option.isSome`, `Option.isNone`, `Option.defaultValue`, `Option.map`, `Option.bind`, `Option.filter`, `Option.orElse`, `Option.toList`, `Option.toResult` |
+| `Result` | `Result.isOk`, `Result.isError`, `Result.defaultValue`, `Result.map`, `Result.mapError`, `Result.bind`, `Result.toOption`, `Result.orElse` |
 | `Regex` | `Regex.isMatch`, `Regex.find`, `Regex.findAll`, `Regex.replace`, `Regex.split`, `Regex.groups` |
 | `Math` | `Math.pi`, `Math.abs`, `Math.min`, `Math.max`, `Math.sqrt`, `Math.pow`, `Math.sin`, `Math.cos`, `Math.floor`, `Math.ceil`, `Math.round` |
 | `Time` | `Time.nowUnixMs`, `Time.nowMs`, `Time.nowIso`, `Time.sleepMs`, `Time.measureMs`, `Time.parseIso`, `Time.formatIso` |

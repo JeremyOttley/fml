@@ -259,6 +259,10 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Option.defaultValue"), TypeScheme{Vars: []TypeID{a}, Body: arrow(a, arrow(optOf(a), a))}, false)
 	c.define(s.InternString("Option.map"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(optOf(a), optOf(b)))}, false)
 	c.define(s.InternString("Option.bind"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, optOf(b)), arrow(optOf(a), optOf(b)))}, false)
+	c.define(s.InternString("Option.filter"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(optOf(a), optOf(a)))}, false)
+	c.define(s.InternString("Option.orElse"), TypeScheme{Vars: []TypeID{a}, Body: arrow(optOf(a), arrow(optOf(a), optOf(a)))}, false)
+	c.define(s.InternString("Option.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(optOf(a), listOf(a))}, false)
+	c.define(s.InternString("Option.toResult"), TypeScheme{Vars: []TypeID{a, e}, Body: arrow(e, arrow(optOf(a), resOf(a, e)))}, false)
 
 	// Result combinators
 	c.define(s.InternString("Result.isOk"), TypeScheme{Vars: []TypeID{a, e}, Body: arrow(resOf(a, e), TypeBool)}, false)
@@ -267,6 +271,8 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Result.map"), TypeScheme{Vars: []TypeID{a, b, e}, Body: arrow(arrow(a, b), arrow(resOf(a, e), resOf(b, e)))}, false)
 	c.define(s.InternString("Result.mapError"), TypeScheme{Vars: []TypeID{a, b, e}, Body: arrow(arrow(e, b), arrow(resOf(a, e), resOf(a, b)))}, false)
 	c.define(s.InternString("Result.bind"), TypeScheme{Vars: []TypeID{a, b, e}, Body: arrow(arrow(a, resOf(b, e)), arrow(resOf(a, e), resOf(b, e)))}, false)
+	c.define(s.InternString("Result.toOption"), TypeScheme{Vars: []TypeID{a, e}, Body: arrow(resOf(a, e), optOf(a))}, false)
+	c.define(s.InternString("Result.orElse"), TypeScheme{Vars: []TypeID{a, e}, Body: arrow(resOf(a, e), arrow(resOf(a, e), resOf(a, e)))}, false)
 
 	// Async concurrency combinators
 	c.define(s.InternString("Async.RunSynchronously"), TypeScheme{Vars: []TypeID{a}, Body: arrow(a, a)}, false)
