@@ -217,13 +217,15 @@ func EmitGoSource(prog *ir.Program) ([]byte, error) {
 	buf.WriteString("import (\n")
 	buf.WriteString("\t\"fmt\"\n")
 	buf.WriteString("\t\"math\"\n")
-	buf.WriteString("\t\"os\"\n\n")
+	buf.WriteString("\t\"os\"\n")
+	buf.WriteString("\t\"strings\"\n\n")
 	buf.WriteString("\t\"fml/internal/ir\"\n")
 	buf.WriteString("\t\"fml/internal/runtime\"\n")
 	buf.WriteString("\t\"fml/internal/stdlib\"\n")
 	buf.WriteString("\t\"fml/internal/token\"\n")
 	buf.WriteString(")\n\n")
-	buf.WriteString("var _ = math.Pi\n\n")
+	buf.WriteString("var _ = math.Pi\n")
+	buf.WriteString("var _ = strings.TrimSpace\n\n")
 
 	// Emit human-readable disassembly comments
 	buf.WriteString("// Lowered 10-Opcode IR Disassembly:\n")
@@ -537,6 +539,28 @@ func emitAOTScalarHelpers(buf *bytes.Buffer) {
 	buf.WriteString("\treturn false\n")
 	buf.WriteString("}\n\n")
 
+	buf.WriteString("func aotLoadString(vm *runtime.VM, env map[token.StringID]runtime.Value, sym token.StringID) string {\n")
+	buf.WriteString("\tif v, ok := env[sym]; ok {\n")
+	buf.WriteString("\t\tif sv, ok := runtime.Deref(v).(runtime.StringVal); ok {\n")
+	buf.WriteString("\t\t\treturn sv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif v, ok := vm.Globals[sym]; ok {\n")
+	buf.WriteString("\t\tif sv, ok := runtime.Deref(v).(runtime.StringVal); ok {\n")
+	buf.WriteString("\t\t\treturn sv.V\n")
+	buf.WriteString("\t\t}\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\treturn \"\"\n")
+	buf.WriteString("}\n\n")
+
+	buf.WriteString("func aotSubstring(start, length int64, s string) string {\n")
+	buf.WriteString("\tif start < 0 {\n\t\tstart = 0\n\t}\n")
+	buf.WriteString("\tif int(start) >= len(s) || length <= 0 {\n\t\treturn \"\"\n\t}\n")
+	buf.WriteString("\tend := int(start + length)\n")
+	buf.WriteString("\tif end > len(s) {\n\t\tend = len(s)\n\t}\n")
+	buf.WriteString("\treturn s[int(start):end]\n")
+	buf.WriteString("}\n\n")
+
 	buf.WriteString("func aotAbsInt(x int64) int64 {\n\tif x < 0 {\n\t\treturn -x\n\t}\n\treturn x\n}\n\n")
 	buf.WriteString("func aotMinInt(a, b int64) int64 {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
 	buf.WriteString("func aotMaxInt(a, b int64) int64 {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
@@ -674,6 +698,42 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 							changed = setInstr(revArgs[1], m) || changed
 							changed = setInstr(revArgs[0], m) || changed
 						}
+					}
+				case "String.length":
+					if len(revArgs) == 1 {
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarInt) || changed
+					}
+				case "String.trim", "String.toUpper", "String.toLower":
+					if len(revArgs) == 1 {
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarString) || changed
+					}
+				case "String.contains", "String.startsWith", "String.endsWith":
+					if len(revArgs) == 2 {
+						changed = setInstr(revArgs[1], scalarString) || changed
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarBool) || changed
+					}
+				case "String.indexOf":
+					if len(revArgs) == 2 {
+						changed = setInstr(revArgs[1], scalarString) || changed
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarInt) || changed
+					}
+				case "String.replace":
+					if len(revArgs) == 3 {
+						changed = setInstr(revArgs[2], scalarString) || changed
+						changed = setInstr(revArgs[1], scalarString) || changed
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarString) || changed
+					}
+				case "String.substring":
+					if len(revArgs) == 3 {
+						changed = setInstr(revArgs[2], scalarInt) || changed
+						changed = setInstr(revArgs[1], scalarInt) || changed
+						changed = setInstr(revArgs[0], scalarString) || changed
+						changed = setInstr(id, scalarString) || changed
 					}
 				}
 				if defID, ok := info.varDef[spine]; ok {
@@ -886,7 +946,7 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 }
 
 func isNativeScalarKind(k scalarKind) bool {
-	return k == scalarInt || k == scalarFloat || k == scalarBool
+	return k == scalarInt || k == scalarFloat || k == scalarBool || k == scalarString
 }
 
 func goTypeForScalar(k scalarKind) string {
@@ -897,6 +957,8 @@ func goTypeForScalar(k scalarKind) string {
 		return "float64"
 	case scalarBool:
 		return "bool"
+	case scalarString:
+		return "string"
 	default:
 		return "int64"
 	}
@@ -1114,6 +1176,10 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 			if ins.SubOp == ir.ConstBool {
 				return fmt.Sprintf("%v", ins.Data != 0), true
 			}
+		case scalarString:
+			if ins.SubOp == ir.ConstString {
+				return fmt.Sprintf("%q", prog.Strings.String(token.StringID(ins.Data))), true
+			}
 		}
 
 	case ir.IRVar:
@@ -1135,6 +1201,8 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 			return fmt.Sprintf("aotLoadFloat(vm, env, token.StringID(%d))", ins.Data), true
 		case scalarBool:
 			return fmt.Sprintf("aotLoadBool(vm, env, token.StringID(%d))", ins.Data), true
+		case scalarString:
+			return fmt.Sprintf("aotLoadString(vm, env, token.StringID(%d))", ins.Data), true
 		}
 
 	case ir.IRLoad:
@@ -1228,6 +1296,66 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 						}
 						return fmt.Sprintf("aotMaxInt(%s, %s)", a0, a1), true
 					}
+				}
+			}
+		case "String.length":
+			if wantKind == scalarInt && len(revArgs) == 1 {
+				if a0, ok0 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars); ok0 {
+					return fmt.Sprintf("int64(len(%s))", a0), true
+				}
+			}
+		case "String.trim", "String.toUpper", "String.toLower":
+			if wantKind == scalarString && len(revArgs) == 1 {
+				if a0, ok0 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars); ok0 {
+					goFn := "strings.TrimSpace"
+					switch mathSym {
+					case "String.toUpper":
+						goFn = "strings.ToUpper"
+					case "String.toLower":
+						goFn = "strings.ToLower"
+					}
+					return fmt.Sprintf("%s(%s)", goFn, a0), true
+				}
+			}
+		case "String.contains", "String.startsWith", "String.endsWith":
+			if wantKind == scalarBool && len(revArgs) == 2 {
+				a0, ok0 := nativeScalarExpr(prog, revArgs[1], scalarString, scalars, candidates, localVars)
+				a1, ok1 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars)
+				if ok0 && ok1 {
+					goFn := "strings.Contains"
+					switch mathSym {
+					case "String.startsWith":
+						goFn = "strings.HasPrefix"
+					case "String.endsWith":
+						goFn = "strings.HasSuffix"
+					}
+					return fmt.Sprintf("%s(%s, %s)", goFn, a1, a0), true
+				}
+			}
+		case "String.indexOf":
+			if wantKind == scalarInt && len(revArgs) == 2 {
+				a0, ok0 := nativeScalarExpr(prog, revArgs[1], scalarString, scalars, candidates, localVars)
+				a1, ok1 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars)
+				if ok0 && ok1 {
+					return fmt.Sprintf("int64(strings.Index(%s, %s))", a1, a0), true
+				}
+			}
+		case "String.replace":
+			if wantKind == scalarString && len(revArgs) == 3 {
+				a0, ok0 := nativeScalarExpr(prog, revArgs[2], scalarString, scalars, candidates, localVars)
+				a1, ok1 := nativeScalarExpr(prog, revArgs[1], scalarString, scalars, candidates, localVars)
+				a2, ok2 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars)
+				if ok0 && ok1 && ok2 {
+					return fmt.Sprintf("strings.ReplaceAll(%s, %s, %s)", a2, a0, a1), true
+				}
+			}
+		case "String.substring":
+			if wantKind == scalarString && len(revArgs) == 3 {
+				a0, ok0 := nativeScalarExpr(prog, revArgs[2], scalarInt, scalars, candidates, localVars)
+				a1, ok1 := nativeScalarExpr(prog, revArgs[1], scalarInt, scalars, candidates, localVars)
+				a2, ok2 := nativeScalarExpr(prog, revArgs[0], scalarString, scalars, candidates, localVars)
+				if ok0 && ok1 && ok2 {
+					return fmt.Sprintf("aotSubstring(%s, %s, %s)", a0, a1, a2), true
 				}
 			}
 		}
@@ -1366,12 +1494,26 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 						return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
 					}
 				}
+				if lhs, okL := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarString, scalars, candidates, localVars); okL {
+					if rhs, okR := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarString, scalars, candidates, localVars); okR {
+						return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
+					}
+				}
 				if ins.SubOp == ir.PrimEq || ins.SubOp == ir.PrimNeq {
 					if lhs, okL := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarBool, scalars, candidates, localVars); okL {
 						if rhs, okR := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarBool, scalars, candidates, localVars); okR {
 							return fmt.Sprintf("(%s %s %s)", lhs, cmpOp, rhs), true
 						}
 					}
+				}
+			}
+
+		case scalarString:
+			if ins.SubOp == ir.PrimAdd {
+				lhs, okL := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarString, scalars, candidates, localVars)
+				rhs, okR := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarString, scalars, candidates, localVars)
+				if okL && okR {
+					return fmt.Sprintf("(%s + %s)", lhs, rhs), true
 				}
 			}
 		}
@@ -1537,6 +1679,13 @@ func unboxedBoolExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (s
 	return nativeScalarExpr(prog, id, scalarBool, scalars, scalars.nativeFns, nil)
 }
 
+func unboxedStringExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (string, bool) {
+	if scalars == nil {
+		return "", false
+	}
+	return nativeScalarExpr(prog, id, scalarString, scalars, scalars.nativeFns, nil)
+}
+
 func primCmpOpString(subOp uint16) string {
 	switch subOp {
 	case ir.PrimEq:
@@ -1565,6 +1714,9 @@ func unboxedValueExpr(prog *ir.Program, id ir.InstrID, scalars *aotScalarInfo) (
 	}
 	if bExpr, ok := unboxedBoolExpr(prog, id, scalars); ok {
 		return fmt.Sprintf("runtime.BoolVal{V: %s}", bExpr), true
+	}
+	if sExpr, ok := unboxedStringExpr(prog, id, scalars); ok {
+		return fmt.Sprintf("runtime.StringVal{V: %s}", sExpr), true
 	}
 	return "", false
 }
@@ -1964,6 +2116,11 @@ func emitCompiledPrim(buf *bytes.Buffer, prog *ir.Program, id ir.InstrID, ins ir
 	if bExpr, ok := unboxedBoolExpr(prog, id, scalars); ok {
 		buf.WriteString("\t\t\t// Unboxed bool specialization\n")
 		fmt.Fprintf(buf, "\t\t\treturn runtime.BoolVal{V: %s}, nil\n", bExpr)
+		return
+	}
+	if sExpr, ok := unboxedStringExpr(prog, id, scalars); ok {
+		buf.WriteString("\t\t\t// Unboxed string specialization\n")
+		fmt.Fprintf(buf, "\t\t\treturn runtime.StringVal{V: %s}, nil\n", sExpr)
 		return
 	}
 	if ins.SubOp == ir.PrimDiv || ins.SubOp == ir.PrimMod {

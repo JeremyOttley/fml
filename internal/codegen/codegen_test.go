@@ -485,3 +485,72 @@ printfn (s144 + h34)
 	}
 }
 
+func TestAOTNativeStringAndComparisonSpecialization(t *testing.T) {
+	src := `
+let normalizeSlug (raw: string) (prefix: string) =
+    let cleaned = String.toLower (String.trim raw)
+    let replaced = String.replace " " "_" cleaned
+    if String.startsWith prefix replaced then
+        replaced
+    else
+        prefix + "_" + replaced
+
+let matchesTarget (candidate: string) (target: string) =
+    let sub = String.substring 0 (String.length target) candidate
+    sub == target && String.contains "_" candidate && String.indexOf "_" candidate > 0
+
+let slug = normalizeSlug "  Compiler Engine  " "fml"
+let okMatch = matchesTarget slug "fml_compiler"
+if okMatch && String.endsWith "_engine" slug then
+    printfn (slug + ":ok")
+else
+    printfn "mismatch"
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_string.fml")
+	binPath := filepath.Join(tmpDir, "native_string_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for normalizeSlug",
+		"(p_0 string, p_1 string) string",
+		"// Native unboxed Go function for matchesTarget",
+		"(p_0 string, p_1 string) bool",
+		"strings.ToLower(",
+		"strings.TrimSpace(",
+		"strings.ReplaceAll(",
+		"strings.HasPrefix(",
+		"strings.Contains(",
+		"strings.Index(",
+		"aotSubstring(",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	if got := strings.TrimSpace(string(out)); got != "fml_compiler_engine:ok" {
+		t.Fatalf("expected 'fml_compiler_engine:ok', got %q", got)
+	}
+}
+
