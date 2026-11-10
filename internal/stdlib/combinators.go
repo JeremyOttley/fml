@@ -630,15 +630,77 @@ func registerStringModule(vm *runtime.VM) {
 			return runtime.StringVal{V: strings.ToLower(s)}, nil
 		},
 	}
+	strStartsWith := &runtime.BuiltinVal{
+		Name:  "String.startsWith",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			prefix := runtime.Deref(args[0]).(runtime.StringVal).V
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			return runtime.BoolVal{V: strings.HasPrefix(s, prefix)}, nil
+		},
+	}
+	strEndsWith := &runtime.BuiltinVal{
+		Name:  "String.endsWith",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			suffix := runtime.Deref(args[0]).(runtime.StringVal).V
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			return runtime.BoolVal{V: strings.HasSuffix(s, suffix)}, nil
+		},
+	}
+	strReplace := &runtime.BuiltinVal{
+		Name:  "String.replace",
+		Arity: 3,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			oldSub := runtime.Deref(args[0]).(runtime.StringVal).V
+			newSub := runtime.Deref(args[1]).(runtime.StringVal).V
+			s := runtime.Deref(args[2]).(runtime.StringVal).V
+			return runtime.StringVal{V: strings.ReplaceAll(s, oldSub, newSub)}, nil
+		},
+	}
+	strIndexOf := &runtime.BuiltinVal{
+		Name:  "String.indexOf",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			sub := runtime.Deref(args[0]).(runtime.StringVal).V
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			return runtime.IntVal{V: int64(strings.Index(s, sub))}, nil
+		},
+	}
+	strSubstring := &runtime.BuiltinVal{
+		Name:  "String.substring",
+		Arity: 3,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			start := int(runtime.Deref(args[0]).(runtime.IntVal).V)
+			length := int(runtime.Deref(args[1]).(runtime.IntVal).V)
+			s := runtime.Deref(args[2]).(runtime.StringVal).V
+			if start < 0 {
+				start = 0
+			}
+			if start >= len(s) || length <= 0 {
+				return runtime.StringVal{V: ""}, nil
+			}
+			end := start + length
+			if end > len(s) {
+				end = len(s)
+			}
+			return runtime.StringVal{V: s[start:end]}, nil
+		},
+	}
 
 	defineModuleRecord(vm, "String", map[string]runtime.Value{
-		"length":   strLength,
-		"trim":     strTrim,
-		"split":    strSplit,
-		"join":     strJoin,
-		"contains": strContains,
-		"toUpper":  strToUpper,
-		"toLower":  strToLower,
+		"length":     strLength,
+		"trim":       strTrim,
+		"split":      strSplit,
+		"join":       strJoin,
+		"contains":   strContains,
+		"toUpper":    strToUpper,
+		"toLower":    strToLower,
+		"startsWith": strStartsWith,
+		"endsWith":   strEndsWith,
+		"replace":    strReplace,
+		"indexOf":    strIndexOf,
+		"substring":  strSubstring,
 	})
 }
 
@@ -1368,12 +1430,40 @@ func registerCryptoModule(vm *runtime.VM) {
 		},
 	}
 
+	cryptoRandomBytesHex := &runtime.BuiltinVal{
+		Name:  "Crypto.randomBytesHex",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			n := int(runtime.Deref(args[0]).(runtime.IntVal).V)
+			if n <= 0 {
+				return runtime.StringVal{V: ""}, nil
+			}
+			buf := make([]byte, n)
+			if _, err := rand.Read(buf); err != nil {
+				return nil, err
+			}
+			return runtime.StringVal{V: hex.EncodeToString(buf)}, nil
+		},
+	}
+
+	cryptoConstantTimeEq := &runtime.BuiltinVal{
+		Name:  "Crypto.constantTimeEq",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			a := runtime.Deref(args[0]).String()
+			b := runtime.Deref(args[1]).String()
+			return runtime.BoolVal{V: hmac.Equal([]byte(a), []byte(b))}, nil
+		},
+	}
+
 	defineModuleRecord(vm, "Crypto", map[string]runtime.Value{
-		"sha256":       cryptoSha256,
-		"hmacSha256":   cryptoHmacSha256,
-		"base64Encode": cryptoBase64Encode,
-		"base64Decode": cryptoBase64Decode,
-		"uuid4":        cryptoUuid4,
+		"sha256":         cryptoSha256,
+		"hmacSha256":     cryptoHmacSha256,
+		"base64Encode":   cryptoBase64Encode,
+		"base64Decode":   cryptoBase64Decode,
+		"uuid4":          cryptoUuid4,
+		"randomBytesHex": cryptoRandomBytesHex,
+		"constantTimeEq": cryptoConstantTimeEq,
 	})
 }
 

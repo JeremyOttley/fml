@@ -228,6 +228,11 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("String.contains"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeBool))}, false)
 	c.define(s.InternString("String.toUpper"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
 	c.define(s.InternString("String.toLower"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
+	c.define(s.InternString("String.startsWith"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeBool))}, false)
+	c.define(s.InternString("String.endsWith"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeBool))}, false)
+	c.define(s.InternString("String.replace"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, arrow(TypeString, TypeString)))}, false)
+	c.define(s.InternString("String.indexOf"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeInt))}, false)
+	c.define(s.InternString("String.substring"), TypeScheme{Body: arrow(TypeInt, arrow(TypeInt, arrow(TypeString, TypeString)))}, false)
 
 	// Option combinators
 	c.define(s.InternString("Option.isSome"), TypeScheme{Vars: []TypeID{a}, Body: arrow(optOf(a), TypeBool)}, false)
@@ -335,6 +340,8 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Crypto.base64Encode"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)
 	c.define(s.InternString("Crypto.base64Decode"), TypeScheme{Body: arrow(TypeString, resOf(TypeString, TypeString))}, false)
 	c.define(s.InternString("Crypto.uuid4"), TypeScheme{Body: arrow(TypeUnit, TypeString)}, false)
+	c.define(s.InternString("Crypto.randomBytesHex"), TypeScheme{Body: arrow(TypeInt, TypeString)}, false)
+	c.define(s.InternString("Crypto.constantTimeEq"), TypeScheme{Body: arrow(TypeString, arrow(TypeString, TypeBool))}, false)
 
 	// File, Json, and Http combinators
 	c.define(s.InternString("File.readText"), TypeScheme{Body: arrow(TypeString, TypeString)}, false)

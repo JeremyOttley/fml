@@ -233,3 +233,30 @@ else
 	}
 }
 
+func TestStringAndCryptoExtendedCombinators(t *testing.T) {
+	src := `
+let raw = "fml_compiler_engine"
+let replaced = raw |> String.replace "compiler" "native"
+let sub = replaced |> String.substring 4 6
+let idx = replaced |> String.indexOf "engine"
+let hasPre = replaced |> String.startsWith "fml_"
+let hasSuf = replaced |> String.endsWith "_engine"
+
+let randHex = Crypto.randomBytesHex 16
+let randLen = String.length randHex
+let eqOk = Crypto.constantTimeEq "secret_token" "secret_token"
+let eqBad = Crypto.constantTimeEq "secret_token" "wrong_token"
+
+if hasPre && hasSuf && sub == "native" && eqOk && (not eqBad) then
+    idx + randLen
+else
+    -1
+`
+	val := evalFML(t, src)
+	// idx = 11 ("fml_native_engine" -> "engine" at index 11), randLen = 32 (16 bytes hex) -> 43
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 43 {
+		t.Fatalf("expected 43 from extended String/Crypto combinators, got %v", val)
+	}
+}
+
+
