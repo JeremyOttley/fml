@@ -88,7 +88,7 @@ func Optimize(prog *Program) {
 				}
 
 			case IRApp:
-				if inlined, ok := tryInlineApp(prog, ins, fnEnv, userSyms, unsafeSyms); ok {
+				if inlined, ok := tryInlineApp(prog, ins, fnEnv, allocEnv, userSyms, unsafeSyms); ok {
 					prog.Instrs[i] = inlined
 					changed = true
 				}
@@ -106,8 +106,8 @@ func Optimize(prog *Program) {
 				}
 
 			case IRSwitch:
-				if target, ok := tryFoldSwitch(prog, ins); ok && int(target) < len(prog.Instrs) {
-					prog.Instrs[i] = prog.Instrs[target]
+				if folded, ok := tryFoldSwitchInstr(prog, ins, allocEnv, unsafeSyms); ok {
+					prog.Instrs[i] = folded
 					changed = true
 				}
 			}
@@ -169,7 +169,26 @@ func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
 	return unsafe
 }
 
-func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+func resolveKnownAlloc(prog *Program, id InstrID, allocEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+	if id == NoInstr || int(id) >= len(prog.Instrs) {
+		return IRInstr{}, false
+	}
+	ins := prog.Instrs[id]
+	if ins.Kind == IRVar {
+		sym := token.StringID(ins.Data)
+		if !unsafeSyms[sym] {
+			if lookedUp, ok := allocEnv[sym]; ok {
+				ins = lookedUp
+			}
+		}
+	}
+	if ins.Kind == IRAlloc && isPureExpr(prog, ins, unsafeSyms) {
+		return ins, true
+	}
+	return IRInstr{}, false
+}
+
+func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	if int(appIns.Arg0) >= len(prog.Instrs) || int(appIns.Arg1) >= len(prog.Instrs) {
 		return IRInstr{}, false
 	}
@@ -207,6 +226,27 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInst
 	}
 	if len(revArgs) == 0 {
 		return IRInstr{}, false
+	}
+
+	// Option / Result / List stdlib intrinsic fusion on known allocations
+	if prog.Strings != nil {
+		var qualName string
+		if headIns.Kind == IRLoad && headIns.SubOp == LoadRecordField && headIns.Aux != 0 {
+			qSym := token.StringID(headIns.Aux)
+			if !userSyms[qSym] && !unsafeSyms[qSym] {
+				qualName = prog.Strings.String(qSym)
+			}
+		} else if headIns.Kind == IRVar && headIns.Data != 0 {
+			qSym := token.StringID(headIns.Data)
+			if !userSyms[qSym] && !unsafeSyms[qSym] {
+				qualName = prog.Strings.String(qSym)
+			}
+		}
+		if qualName != "" {
+			if fused, ok := tryFuseStdlibCombinator(prog, qualName, revArgs, fnEnv, allocEnv, userSyms, unsafeSyms); ok {
+				return fused, true
+			}
+		}
 	}
 
 	if headIns.Kind == IRVar {
@@ -273,6 +313,10 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInst
 		}
 	}
 
+	return tryInlineBodyExpr(prog, bodyID, bodyIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms)
+}
+
+func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToArg map[token.StringID]InstrID, allConstArgs bool, maxParamUses int, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	switch bodyIns.Kind {
 	case IRConst:
 		return bodyIns, true
@@ -281,6 +325,25 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInst
 			return prog.Instrs[argID], true
 		}
 		return bodyIns, true
+	case IRAlloc:
+		if bodyIns.SubOp == AllocADT {
+			if InstrID(bodyIns.Arg0) == NoInstr {
+				return bodyIns, true
+			}
+			if int(bodyIns.Arg0) < len(prog.Instrs) {
+				pIns := prog.Instrs[bodyIns.Arg0]
+				if pIns.Kind == IRVar {
+					if argID, ok := paramToArg[token.StringID(pIns.Data)]; ok {
+						return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(argID), Data: bodyIns.Data}, true
+					}
+					return bodyIns, true
+				}
+				if inlinedPayload, ok := tryInlineBodyExpr(prog, InstrID(bodyIns.Arg0), pIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms); ok {
+					pID := prog.Emit(inlinedPayload)
+					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(pID), Data: bodyIns.Data}, true
+				}
+			}
+		}
 	case IRPrim:
 		if bodyIns.SubOp == PrimSeqBlock || bodyIns.SubOp == PrimWhile || bodyIns.SubOp == PrimForIn || bodyIns.SubOp == PrimForTo || int(bodyIns.Arg0) >= len(prog.Instrs) {
 			return IRInstr{}, false
@@ -352,6 +415,142 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv map[token.StringID]IRInst
 	return IRInstr{}, false
 }
 
+func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, fnEnv, allocEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+	switch len(revArgs) {
+	case 1:
+		argID := revArgs[0]
+		allocIns, ok := resolveKnownAlloc(prog, argID, allocEnv, unsafeSyms)
+		if !ok {
+			return IRInstr{}, false
+		}
+		switch qualName {
+		case "Option.isSome":
+			if allocIns.SubOp == AllocADT {
+				tag := prog.Strings.String(token.StringID(allocIns.Data))
+				return boolConstInstr(tag == "Some"), true
+			}
+		case "Option.isNone":
+			if allocIns.SubOp == AllocADT {
+				tag := prog.Strings.String(token.StringID(allocIns.Data))
+				return boolConstInstr(tag == "None"), true
+			}
+		case "Result.isOk":
+			if allocIns.SubOp == AllocADT {
+				tag := prog.Strings.String(token.StringID(allocIns.Data))
+				return boolConstInstr(tag == "Ok"), true
+			}
+		case "Result.isError":
+			if allocIns.SubOp == AllocADT {
+				tag := prog.Strings.String(token.StringID(allocIns.Data))
+				return boolConstInstr(tag == "Error"), true
+			}
+		case "List.isEmpty":
+			if allocIns.SubOp == AllocList {
+				return boolConstInstr(allocIns.Arg1 == 0), true
+			}
+		case "List.length":
+			if allocIns.SubOp == AllocList {
+				return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(allocIns.Arg1)}, true
+			}
+		case "List.head":
+			if allocIns.SubOp == AllocList && allocIns.Arg1 > 0 && int(allocIns.Arg0) < len(prog.Extra) {
+				headID := prog.Extra[allocIns.Arg0]
+				if int(headID) < len(prog.Instrs) {
+					return prog.Instrs[headID], true
+				}
+			}
+		}
+
+	case 2:
+		firstArg := revArgs[1]
+		secondArg := revArgs[0]
+		if int(firstArg) >= len(prog.Instrs) || int(secondArg) >= len(prog.Instrs) {
+			return IRInstr{}, false
+		}
+		firstIns := prog.Instrs[firstArg]
+		adtIns, ok := resolveKnownAlloc(prog, secondArg, allocEnv, unsafeSyms)
+		if !ok || adtIns.SubOp != AllocADT {
+			return IRInstr{}, false
+		}
+		tag := prog.Strings.String(token.StringID(adtIns.Data))
+		switch qualName {
+		case "Option.defaultValue":
+			if tag == "Some" && InstrID(adtIns.Arg0) != NoInstr && int(adtIns.Arg0) < len(prog.Instrs) && isPureExpr(prog, firstIns, unsafeSyms) {
+				return prog.Instrs[adtIns.Arg0], true
+			}
+			if tag == "None" {
+				return firstIns, true
+			}
+		case "Result.defaultValue":
+			if tag == "Ok" && InstrID(adtIns.Arg0) != NoInstr && int(adtIns.Arg0) < len(prog.Instrs) && isPureExpr(prog, firstIns, unsafeSyms) {
+				return prog.Instrs[adtIns.Arg0], true
+			}
+			if tag == "Error" {
+				return firstIns, true
+			}
+		case "Option.orElse":
+			if tag == "Some" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+			if tag == "None" {
+				return firstIns, true
+			}
+		case "Result.orElse":
+			if tag == "Ok" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+			if tag == "Error" {
+				return firstIns, true
+			}
+		case "Option.bind":
+			if tag == "Some" && InstrID(adtIns.Arg0) != NoInstr {
+				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
+				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+					return inlined, true
+				}
+				return app, true
+			}
+			if tag == "None" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+		case "Result.bind":
+			if tag == "Ok" && InstrID(adtIns.Arg0) != NoInstr {
+				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
+				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+					return inlined, true
+				}
+				return app, true
+			}
+			if tag == "Error" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+		case "Option.map":
+			if tag == "None" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+			if tag == "Some" && InstrID(adtIns.Arg0) != NoInstr {
+				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
+				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+					valID := prog.Emit(inlined)
+					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(valID), Data: adtIns.Data}, true
+				}
+			}
+		case "Result.map":
+			if tag == "Error" && isPureExpr(prog, firstIns, unsafeSyms) {
+				return adtIns, true
+			}
+			if tag == "Ok" && InstrID(adtIns.Arg0) != NoInstr {
+				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
+				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+					valID := prog.Emit(inlined)
+					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(valID), Data: adtIns.Data}, true
+				}
+			}
+		}
+	}
+	return IRInstr{}, false
+}
+
 func evalInlineConstExpr(prog *Program, id InstrID, paramToArg map[token.StringID]InstrID, depth int) (IRInstr, bool) {
 	if depth > 4 || id == NoInstr || int(id) >= len(prog.Instrs) {
 		return IRInstr{}, false
@@ -394,18 +593,34 @@ func evalInlineConstExpr(prog *Program, id InstrID, paramToArg map[token.StringI
 func eliminateDeadBindings(prog *Program, unsafeSyms map[token.StringID]bool) bool {
 	changed := false
 
-	// 1. Eliminate scoped `let unused = pure in body`
+	// 1. Eliminate scoped `let x = rhs in x` and `let unused = pure in body`
 	for i := 0; i < len(prog.Instrs); i++ {
 		ins := prog.Instrs[i]
 		if ins.Kind == IRLet && ins.Flags == 0 && InstrID(ins.Arg1) != NoInstr &&
 			int(ins.Arg0) < len(prog.Instrs) && int(ins.Arg1) < len(prog.Instrs) {
 			sym := token.StringID(ins.Data)
-			if !unsafeSyms[sym] && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms) {
-				bodyUses := make(map[token.StringID]int)
-				markReachableUses(prog, InstrID(ins.Arg1), bodyUses, make(map[InstrID]bool))
-				if bodyUses[sym] == 0 {
-					prog.Instrs[i] = prog.Instrs[ins.Arg1]
+			if !unsafeSyms[sym] {
+				bodyIns := prog.Instrs[ins.Arg1]
+				if bodyIns.Kind == IRVar && token.StringID(bodyIns.Data) == sym {
+					prog.Instrs[i] = prog.Instrs[ins.Arg0]
 					changed = true
+					continue
+				}
+				if isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms) {
+					bodyUses := make(map[token.StringID]int)
+					markReachableUses(prog, InstrID(ins.Arg1), bodyUses, make(map[InstrID]bool))
+					if bodyUses[sym] == 0 {
+						prog.Instrs[i] = prog.Instrs[ins.Arg1]
+						changed = true
+						continue
+					}
+					rhs := prog.Instrs[ins.Arg0]
+					if bodyUses[sym] == 1 && isInlinablePurePrim(prog, rhs, unsafeSyms) &&
+						countSameScopeVarUses(prog, InstrID(ins.Arg1), sym) == 1 {
+						replaceSameScopeVar(prog, InstrID(ins.Arg1), sym, rhs)
+						prog.Instrs[i] = prog.Instrs[ins.Arg1]
+						changed = true
+					}
 				}
 			}
 		}
@@ -414,10 +629,18 @@ func eliminateDeadBindings(prog *Program, unsafeSyms map[token.StringID]bool) bo
 	// 2. Recompute reachable variable uses from Root (excluding dead top-level IRLet RHSs)
 	usedSyms := computeLiveSymbolUses(prog)
 
-	// 3. Prune dead pure non-final elements in PrimSeqBlock instructions
+	// 3. Prune dead pure non-final elements and fuse single-use pure bindings in PrimSeqBlock instructions
 	for i := 0; i < len(prog.Instrs); i++ {
 		ins := prog.Instrs[i]
-		if ins.Kind != IRPrim || ins.SubOp != PrimSeqBlock || ins.Arg1 <= 1 {
+		if ins.Kind != IRPrim || ins.SubOp != PrimSeqBlock || ins.Arg1 == 0 {
+			continue
+		}
+		if ins.Arg1 == 1 {
+			chID := InstrID(prog.Extra[ins.Arg0])
+			if int(chID) < len(prog.Instrs) {
+				prog.Instrs[i] = prog.Instrs[chID]
+				changed = true
+			}
 			continue
 		}
 		var kept []InstrID
@@ -433,18 +656,63 @@ func eliminateDeadBindings(prog *Program, unsafeSyms map[token.StringID]bool) bo
 				if chIns.Kind == IRLet && chIns.Flags == 0 && InstrID(chIns.Arg1) == NoInstr &&
 					int(chIns.Arg0) < len(prog.Instrs) {
 					sym := token.StringID(chIns.Data)
-					if !unsafeSyms[sym] && usedSyms[sym] == 0 && isPureExpr(prog, prog.Instrs[chIns.Arg0], unsafeSyms) {
+					rhs := prog.Instrs[chIns.Arg0]
+					if !unsafeSyms[sym] && usedSyms[sym] == 0 && isPureExpr(prog, rhs, unsafeSyms) {
 						changed = true
 						continue
 					}
+					if !unsafeSyms[sym] && usedSyms[sym] == 1 && isInlinablePurePrim(prog, rhs, unsafeSyms) {
+						remUses := 0
+						for k := j + 1; k < ins.Arg1; k++ {
+							remUses += countSameScopeVarUses(prog, InstrID(prog.Extra[ins.Arg0+k]), sym)
+						}
+						if remUses == 1 {
+							for k := j + 1; k < ins.Arg1; k++ {
+								replaceSameScopeVar(prog, InstrID(prog.Extra[ins.Arg0+k]), sym, rhs)
+							}
+							usedSyms[sym] = 0
+							changed = true
+							continue
+						}
+					}
+				}
+			}
+			// If the final child of a PrimSeqBlock is itself a PrimSeqBlock, splice its children flat
+			if isLast && int(chID) < len(prog.Instrs) {
+				chIns := prog.Instrs[chID]
+				if chIns.Kind == IRPrim && chIns.SubOp == PrimSeqBlock && chIns.Arg1 > 0 && int(chIns.Arg0+chIns.Arg1) <= len(prog.Extra) {
+					for k := uint32(0); k < chIns.Arg1; k++ {
+						kept = append(kept, InstrID(prog.Extra[chIns.Arg0+k]))
+					}
+					changed = true
+					continue
 				}
 			}
 			kept = append(kept, chID)
 		}
+		// Collapse trailing `[..., IRLet(x, rhs), IRVar(x)]` into `[..., rhs]` when x has 1 use
+		if len(kept) >= 2 {
+			prevID := kept[len(kept)-2]
+			lastID := kept[len(kept)-1]
+			if int(prevID) < len(prog.Instrs) && int(lastID) < len(prog.Instrs) {
+				prevIns := prog.Instrs[prevID]
+				lastIns := prog.Instrs[lastID]
+				if prevIns.Kind == IRLet && prevIns.Flags == 0 && InstrID(prevIns.Arg1) == NoInstr &&
+					lastIns.Kind == IRVar && lastIns.Data == prevIns.Data && prevIns.Data != 0 {
+					sym := token.StringID(prevIns.Data)
+					if !unsafeSyms[sym] && usedSyms[sym] == 1 {
+						kept[len(kept)-2] = InstrID(prevIns.Arg0)
+						kept = kept[:len(kept)-1]
+						usedSyms[sym] = 0
+						changed = true
+					}
+				}
+			}
+		}
 		if len(kept) == 1 && int(kept[0]) < len(prog.Instrs) {
 			prog.Instrs[i] = prog.Instrs[kept[0]]
 			changed = true
-		} else if uint32(len(kept)) < ins.Arg1 {
+		} else if uint32(len(kept)) != ins.Arg1 {
 			start, count := prog.AddExtra(kept)
 			prog.Instrs[i].Arg0 = start
 			prog.Instrs[i].Arg1 = count
@@ -453,6 +721,173 @@ func eliminateDeadBindings(prog *Program, unsafeSyms map[token.StringID]bool) bo
 	}
 
 	return changed
+}
+
+func isInlinablePurePrim(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) bool {
+	if ins.Kind != IRPrim {
+		return false
+	}
+	switch ins.SubOp {
+	case PrimNeg, PrimNot, PrimAdd, PrimSub, PrimMul, PrimEq, PrimNeq, PrimLt, PrimLe, PrimGt, PrimGe, PrimAnd, PrimOr:
+		return isPureExpr(prog, ins, unsafeSyms)
+	}
+	return false
+}
+
+func countSameScopeVarUses(prog *Program, id InstrID, target token.StringID) int {
+	if id == NoInstr || int(id) >= len(prog.Instrs) {
+		return 0
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case IRConst, IRFn:
+		return 0
+	case IRVar:
+		if token.StringID(ins.Data) == target {
+			return 1
+		}
+		return 0
+	case IRLet:
+		c := countSameScopeVarUses(prog, InstrID(ins.Arg0), target)
+		if InstrID(ins.Arg1) != NoInstr {
+			c += countSameScopeVarUses(prog, InstrID(ins.Arg1), target)
+		}
+		return c
+	case IRApp:
+		return countSameScopeVarUses(prog, InstrID(ins.Arg0), target) +
+			countSameScopeVarUses(prog, InstrID(ins.Arg1), target)
+	case IRSwitch:
+		c := countSameScopeVarUses(prog, InstrID(ins.Arg0), target)
+		count := uint32(ins.Data)
+		for i := uint32(0); i < count; i++ {
+			idx := ins.Arg1 + i*2 + 1
+			if int(idx) < len(prog.Extra) {
+				c += countSameScopeVarUses(prog, InstrID(prog.Extra[idx]), target)
+			}
+		}
+		if InstrID(ins.Aux) != NoInstr {
+			c += countSameScopeVarUses(prog, InstrID(ins.Aux), target)
+		}
+		return c
+	case IRPrim:
+		if ins.SubOp == PrimWhile || ins.SubOp == PrimForIn || ins.SubOp == PrimForTo {
+			return 0
+		}
+		if ins.SubOp == PrimSeqBlock {
+			c := 0
+			for i := uint32(0); i < ins.Arg1; i++ {
+				if int(ins.Arg0+i) < len(prog.Extra) {
+					c += countSameScopeVarUses(prog, InstrID(prog.Extra[ins.Arg0+i]), target)
+				}
+			}
+			return c
+		}
+		c := countSameScopeVarUses(prog, InstrID(ins.Arg0), target)
+		if InstrID(ins.Arg1) != NoInstr {
+			c += countSameScopeVarUses(prog, InstrID(ins.Arg1), target)
+		}
+		return c
+	case IRAlloc:
+		if ins.SubOp == AllocADT {
+			return countSameScopeVarUses(prog, InstrID(ins.Arg0), target)
+		}
+		if ins.SubOp == AllocRecord {
+			c := 0
+			if ins.Flags != 0 {
+				c += countSameScopeVarUses(prog, InstrID(ins.Aux), target)
+			}
+			for i := uint32(0); i+1 < ins.Arg1; i += 2 {
+				if int(ins.Arg0+i+1) < len(prog.Extra) {
+					c += countSameScopeVarUses(prog, InstrID(prog.Extra[ins.Arg0+i+1]), target)
+				}
+			}
+			return c
+		}
+		c := 0
+		for i := uint32(0); i < ins.Arg1; i++ {
+			if int(ins.Arg0+i) < len(prog.Extra) {
+				c += countSameScopeVarUses(prog, InstrID(prog.Extra[ins.Arg0+i]), target)
+			}
+		}
+		return c
+	case IRLoad:
+		return countSameScopeVarUses(prog, InstrID(ins.Arg0), target)
+	}
+	return 0
+}
+
+func replaceSameScopeVar(prog *Program, id InstrID, target token.StringID, replacement IRInstr) {
+	if id == NoInstr || int(id) >= len(prog.Instrs) {
+		return
+	}
+	ins := prog.Instrs[id]
+	switch ins.Kind {
+	case IRConst, IRFn:
+		return
+	case IRVar:
+		if token.StringID(ins.Data) == target {
+			prog.Instrs[id] = replacement
+		}
+	case IRLet:
+		replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+		if InstrID(ins.Arg1) != NoInstr {
+			replaceSameScopeVar(prog, InstrID(ins.Arg1), target, replacement)
+		}
+	case IRApp:
+		replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+		replaceSameScopeVar(prog, InstrID(ins.Arg1), target, replacement)
+	case IRSwitch:
+		replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+		count := uint32(ins.Data)
+		for i := uint32(0); i < count; i++ {
+			idx := ins.Arg1 + i*2 + 1
+			if int(idx) < len(prog.Extra) {
+				replaceSameScopeVar(prog, InstrID(prog.Extra[idx]), target, replacement)
+			}
+		}
+		if InstrID(ins.Aux) != NoInstr {
+			replaceSameScopeVar(prog, InstrID(ins.Aux), target, replacement)
+		}
+	case IRPrim:
+		if ins.SubOp == PrimWhile || ins.SubOp == PrimForIn || ins.SubOp == PrimForTo {
+			return
+		}
+		if ins.SubOp == PrimSeqBlock {
+			for i := uint32(0); i < ins.Arg1; i++ {
+				if int(ins.Arg0+i) < len(prog.Extra) {
+					replaceSameScopeVar(prog, InstrID(prog.Extra[ins.Arg0+i]), target, replacement)
+				}
+			}
+			return
+		}
+		replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+		if InstrID(ins.Arg1) != NoInstr {
+			replaceSameScopeVar(prog, InstrID(ins.Arg1), target, replacement)
+		}
+	case IRAlloc:
+		if ins.SubOp == AllocADT {
+			replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+			return
+		}
+		if ins.SubOp == AllocRecord {
+			if ins.Flags != 0 {
+				replaceSameScopeVar(prog, InstrID(ins.Aux), target, replacement)
+			}
+			for i := uint32(0); i+1 < ins.Arg1; i += 2 {
+				if int(ins.Arg0+i+1) < len(prog.Extra) {
+					replaceSameScopeVar(prog, InstrID(prog.Extra[ins.Arg0+i+1]), target, replacement)
+				}
+			}
+			return
+		}
+		for i := uint32(0); i < ins.Arg1; i++ {
+			if int(ins.Arg0+i) < len(prog.Extra) {
+				replaceSameScopeVar(prog, InstrID(prog.Extra[ins.Arg0+i]), target, replacement)
+			}
+		}
+	case IRLoad:
+		replaceSameScopeVar(prog, InstrID(ins.Arg0), target, replacement)
+	}
 }
 
 func tryFoldLoad(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
@@ -520,19 +955,59 @@ func tryFoldLoad(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr
 }
 
 func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) bool {
+	return isPureExprDepth(prog, ins, unsafeSyms, 0)
+}
+
+func isPureExprDepth(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool, depth int) bool {
+	if depth > 8 {
+		return false
+	}
 	switch ins.Kind {
 	case IRConst, IRFn:
 		return true
 	case IRVar:
 		return !unsafeSyms[token.StringID(ins.Data)]
+	case IRLet:
+		if ins.Flags != 0 || int(ins.Arg0) >= len(prog.Instrs) || !isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1) {
+			return false
+		}
+		if InstrID(ins.Arg1) != NoInstr {
+			return int(ins.Arg1) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg1], unsafeSyms, depth+1)
+		}
+		return true
+	case IRSwitch:
+		if int(ins.Arg0) >= len(prog.Instrs) || !isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1) {
+			return false
+		}
+		count := uint32(ins.Data)
+		for i := uint32(0); i < count; i++ {
+			idx := ins.Arg1 + i*2 + 1
+			if int(idx) >= len(prog.Extra) || int(prog.Extra[idx]) >= len(prog.Instrs) ||
+				!isPureExprDepth(prog, prog.Instrs[prog.Extra[idx]], unsafeSyms, depth+1) {
+				return false
+			}
+		}
+		if InstrID(ins.Aux) != NoInstr {
+			return int(ins.Aux) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Aux], unsafeSyms, depth+1)
+		}
+		return true
 	case IRPrim:
 		switch ins.SubOp {
+		case PrimSeqBlock:
+			for i := uint32(0); i < ins.Arg1; i++ {
+				idx := ins.Arg0 + i
+				if int(idx) >= len(prog.Extra) || int(prog.Extra[idx]) >= len(prog.Instrs) ||
+					!isPureExprDepth(prog, prog.Instrs[prog.Extra[idx]], unsafeSyms, depth+1) {
+					return false
+				}
+			}
+			return true
 		case PrimNeg, PrimNot:
-			return int(ins.Arg0) < len(prog.Instrs) && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms)
+			return int(ins.Arg0) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1)
 		case PrimAdd, PrimSub, PrimMul, PrimEq, PrimNeq, PrimLt, PrimLe, PrimGt, PrimGe, PrimAnd, PrimOr:
 			return int(ins.Arg0) < len(prog.Instrs) && int(ins.Arg1) < len(prog.Instrs) &&
-				isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms) &&
-				isPureExpr(prog, prog.Instrs[ins.Arg1], unsafeSyms)
+				isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1) &&
+				isPureExprDepth(prog, prog.Instrs[ins.Arg1], unsafeSyms, depth+1)
 		}
 	case IRAlloc:
 		switch ins.SubOp {
@@ -540,12 +1015,12 @@ func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) 
 			if InstrID(ins.Arg0) == NoInstr {
 				return true
 			}
-			return int(ins.Arg0) < len(prog.Instrs) && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms)
+			return int(ins.Arg0) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1)
 		case AllocTuple, AllocList:
 			for i := uint32(0); i < ins.Arg1; i++ {
 				idx := ins.Arg0 + i
 				if int(idx) >= len(prog.Extra) || int(prog.Extra[idx]) >= len(prog.Instrs) ||
-					!isPureExpr(prog, prog.Instrs[prog.Extra[idx]], unsafeSyms) {
+					!isPureExprDepth(prog, prog.Instrs[prog.Extra[idx]], unsafeSyms, depth+1) {
 					return false
 				}
 			}
@@ -557,7 +1032,7 @@ func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) 
 			for i := uint32(0); i+1 < ins.Arg1; i += 2 {
 				valIdx := ins.Arg0 + i + 1
 				if int(valIdx) >= len(prog.Extra) || int(prog.Extra[valIdx]) >= len(prog.Instrs) ||
-					!isPureExpr(prog, prog.Instrs[prog.Extra[valIdx]], unsafeSyms) {
+					!isPureExprDepth(prog, prog.Instrs[prog.Extra[valIdx]], unsafeSyms, depth+1) {
 					return false
 				}
 			}
@@ -566,7 +1041,7 @@ func isPureExpr(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) 
 	case IRLoad:
 		switch ins.SubOp {
 		case LoadTupleElem, LoadRecordField, LoadADTPayload, LoadADTTag, LoadListHead, LoadListTail, LoadListIsEmpty:
-			return int(ins.Arg0) < len(prog.Instrs) && isPureExpr(prog, prog.Instrs[ins.Arg0], unsafeSyms)
+			return int(ins.Arg0) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1)
 		}
 	}
 	return false
@@ -901,6 +1376,45 @@ func samePureOperand(lhs, rhs IRInstr, unsafeSyms map[token.StringID]bool) bool 
 	return false
 }
 
+func isKnownBoolExpr(ins IRInstr) bool {
+	if ins.Kind == IRConst && ins.SubOp == ConstBool {
+		return true
+	}
+	if ins.Kind == IRPrim {
+		switch ins.SubOp {
+		case PrimNot, PrimAnd, PrimOr, PrimEq, PrimNeq, PrimLt, PrimLe, PrimGt, PrimGe:
+			return true
+		}
+	}
+	return false
+}
+
+func samePureExpr(prog *Program, lhs, rhs IRInstr, unsafeSyms map[token.StringID]bool) bool {
+	if samePureOperand(lhs, rhs, unsafeSyms) {
+		return true
+	}
+	if lhs.Kind == IRPrim && rhs.Kind == IRPrim && lhs.SubOp == rhs.SubOp && lhs.Flags == rhs.Flags {
+		switch lhs.SubOp {
+		case PrimNeg, PrimNot:
+			return int(lhs.Arg0) < len(prog.Instrs) && int(rhs.Arg0) < len(prog.Instrs) &&
+				samePureOperand(prog.Instrs[lhs.Arg0], prog.Instrs[rhs.Arg0], unsafeSyms)
+		case PrimAdd, PrimSub, PrimMul, PrimEq, PrimNeq, PrimLt, PrimLe, PrimGt, PrimGe, PrimAnd, PrimOr:
+			return int(lhs.Arg0) < len(prog.Instrs) && int(rhs.Arg0) < len(prog.Instrs) &&
+				int(lhs.Arg1) < len(prog.Instrs) && int(rhs.Arg1) < len(prog.Instrs) &&
+				samePureOperand(prog.Instrs[lhs.Arg0], prog.Instrs[rhs.Arg0], unsafeSyms) &&
+				samePureOperand(prog.Instrs[lhs.Arg1], prog.Instrs[rhs.Arg1], unsafeSyms)
+		}
+	}
+	return false
+}
+
+func isNegationOf(prog *Program, cand, other IRInstr, unsafeSyms map[token.StringID]bool) bool {
+	if cand.Kind != IRPrim || cand.SubOp != PrimNot || int(cand.Arg0) >= len(prog.Instrs) {
+		return false
+	}
+	return samePureExpr(prog, prog.Instrs[cand.Arg0], other, unsafeSyms)
+}
+
 func tryFoldPrim(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	if ins.SubOp == PrimSeqBlock && ins.Arg1 == 1 {
 		childID := prog.Extra[ins.Arg0]
@@ -920,6 +1434,15 @@ func tryFoldPrim(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]bool)
 		// Double negation elimination: -(-x) -> x, not (not x) -> x
 		if lhs.Kind == IRPrim && lhs.SubOp == ins.SubOp && int(lhs.Arg0) < len(prog.Instrs) {
 			return prog.Instrs[lhs.Arg0], true
+		}
+		// Negated equality inversion: not (a == b) -> a != b, not (a != b) -> a == b
+		if ins.SubOp == PrimNot && lhs.Kind == IRPrim {
+			switch lhs.SubOp {
+			case PrimEq:
+				return IRInstr{Kind: IRPrim, SubOp: PrimNeq, Flags: lhs.Flags, Arg0: lhs.Arg0, Arg1: lhs.Arg1}, true
+			case PrimNeq:
+				return IRInstr{Kind: IRPrim, SubOp: PrimEq, Flags: lhs.Flags, Arg0: lhs.Arg0, Arg1: lhs.Arg1}, true
+			}
 		}
 		return IRInstr{}, false
 	}
@@ -942,6 +1465,32 @@ func tryAlgebraicSimplify(prog *Program, ins IRInstr, lhs, rhs IRInstr, unsafeSy
 		if isIntConstVal(lhs, 0) || isFloatConstVal(lhs, 0) {
 			return rhs, true
 		}
+		// (x - y) + y -> x
+		if lhs.Kind == IRPrim && lhs.SubOp == PrimSub && lhs.Flags == 0 &&
+			int(lhs.Arg0) < len(prog.Instrs) && int(lhs.Arg1) < len(prog.Instrs) &&
+			samePureOperand(prog.Instrs[lhs.Arg1], rhs, unsafeSyms) &&
+			isPureExpr(prog, prog.Instrs[lhs.Arg0], unsafeSyms) {
+			return prog.Instrs[lhs.Arg0], true
+		}
+		// (x + c1) + c2 -> x + (c1 + c2) when c1, c2 are int constants
+		if lhs.Kind == IRPrim && (lhs.SubOp == PrimAdd || lhs.SubOp == PrimSub) && lhs.Flags == 0 &&
+			int(lhs.Arg0) < len(prog.Instrs) && int(lhs.Arg1) < len(prog.Instrs) &&
+			rhs.Kind == IRConst && rhs.SubOp == ConstInt {
+			l1 := prog.Instrs[lhs.Arg1]
+			if l1.Kind == IRConst && l1.SubOp == ConstInt {
+				c1 := int64(l1.Data)
+				if lhs.SubOp == PrimSub {
+					c1 = -c1
+				}
+				cSum := c1 + int64(rhs.Data)
+				if cSum == 0 {
+					return prog.Instrs[lhs.Arg0], true
+				}
+				cID := prog.Emit(IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(cSum)})
+				return IRInstr{Kind: IRPrim, SubOp: PrimAdd, Arg0: lhs.Arg0, Arg1: uint32(cID)}, true
+			}
+		}
+
 	case PrimSub:
 		if isIntConstVal(rhs, 0) || isFloatConstVal(rhs, 0) {
 			return lhs, true
@@ -949,6 +1498,37 @@ func tryAlgebraicSimplify(prog *Program, ins IRInstr, lhs, rhs IRInstr, unsafeSy
 		if ins.Flags == 0 && samePureOperand(lhs, rhs, unsafeSyms) {
 			return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: 0}, true
 		}
+		// (x + y) - y -> x, (y + x) - y -> x
+		if lhs.Kind == IRPrim && lhs.SubOp == PrimAdd && lhs.Flags == 0 &&
+			int(lhs.Arg0) < len(prog.Instrs) && int(lhs.Arg1) < len(prog.Instrs) {
+			l0 := prog.Instrs[lhs.Arg0]
+			l1 := prog.Instrs[lhs.Arg1]
+			if samePureOperand(l1, rhs, unsafeSyms) && isPureExpr(prog, l0, unsafeSyms) {
+				return l0, true
+			}
+			if samePureOperand(l0, rhs, unsafeSyms) && isPureExpr(prog, l1, unsafeSyms) {
+				return l1, true
+			}
+		}
+		// (x + c1) - c2 -> x + (c1 - c2) when c1, c2 are int constants
+		if lhs.Kind == IRPrim && (lhs.SubOp == PrimAdd || lhs.SubOp == PrimSub) && lhs.Flags == 0 &&
+			int(lhs.Arg0) < len(prog.Instrs) && int(lhs.Arg1) < len(prog.Instrs) &&
+			rhs.Kind == IRConst && rhs.SubOp == ConstInt {
+			l1 := prog.Instrs[lhs.Arg1]
+			if l1.Kind == IRConst && l1.SubOp == ConstInt {
+				c1 := int64(l1.Data)
+				if lhs.SubOp == PrimSub {
+					c1 = -c1
+				}
+				cDiff := c1 - int64(rhs.Data)
+				if cDiff == 0 {
+					return prog.Instrs[lhs.Arg0], true
+				}
+				cID := prog.Emit(IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(cDiff)})
+				return IRInstr{Kind: IRPrim, SubOp: PrimAdd, Arg0: lhs.Arg0, Arg1: uint32(cID)}, true
+			}
+		}
+
 	case PrimMul:
 		if isIntConstVal(rhs, 1) || isFloatConstVal(rhs, 1) {
 			return lhs, true
@@ -982,6 +1562,9 @@ func tryAlgebraicSimplify(prog *Program, ins IRInstr, lhs, rhs IRInstr, unsafeSy
 		if samePureOperand(lhs, rhs, unsafeSyms) {
 			return lhs, true
 		}
+		if isNegationOf(prog, lhs, rhs, unsafeSyms) || isNegationOf(prog, rhs, lhs, unsafeSyms) {
+			return boolConstInstr(false), true
+		}
 	case PrimOr:
 		if isBoolConstVal(rhs, false) {
 			return lhs, true
@@ -998,11 +1581,46 @@ func tryAlgebraicSimplify(prog *Program, ins IRInstr, lhs, rhs IRInstr, unsafeSy
 		if samePureOperand(lhs, rhs, unsafeSyms) {
 			return lhs, true
 		}
-	case PrimEq, PrimLe, PrimGe:
+		if isNegationOf(prog, lhs, rhs, unsafeSyms) || isNegationOf(prog, rhs, lhs, unsafeSyms) {
+			return boolConstInstr(true), true
+		}
+	case PrimEq:
 		if samePureOperand(lhs, rhs, unsafeSyms) {
 			return boolConstInstr(true), true
 		}
-	case PrimNeq, PrimLt, PrimGt:
+		if isKnownBoolExpr(lhs) && rhs.Kind == IRConst && rhs.SubOp == ConstBool {
+			if rhs.Data != 0 {
+				return lhs, true
+			}
+			return IRInstr{Kind: IRPrim, SubOp: PrimNot, Arg0: ins.Arg0, Arg1: uint32(NoInstr)}, true
+		}
+		if isKnownBoolExpr(rhs) && lhs.Kind == IRConst && lhs.SubOp == ConstBool {
+			if lhs.Data != 0 {
+				return rhs, true
+			}
+			return IRInstr{Kind: IRPrim, SubOp: PrimNot, Arg0: ins.Arg1, Arg1: uint32(NoInstr)}, true
+		}
+	case PrimLe, PrimGe:
+		if samePureOperand(lhs, rhs, unsafeSyms) {
+			return boolConstInstr(true), true
+		}
+	case PrimNeq:
+		if samePureOperand(lhs, rhs, unsafeSyms) {
+			return boolConstInstr(false), true
+		}
+		if isKnownBoolExpr(lhs) && rhs.Kind == IRConst && rhs.SubOp == ConstBool {
+			if rhs.Data == 0 {
+				return lhs, true
+			}
+			return IRInstr{Kind: IRPrim, SubOp: PrimNot, Arg0: ins.Arg0, Arg1: uint32(NoInstr)}, true
+		}
+		if isKnownBoolExpr(rhs) && lhs.Kind == IRConst && lhs.SubOp == ConstBool {
+			if lhs.Data == 0 {
+				return rhs, true
+			}
+			return IRInstr{Kind: IRPrim, SubOp: PrimNot, Arg0: ins.Arg1, Arg1: uint32(NoInstr)}, true
+		}
+	case PrimLt, PrimGt:
 		if samePureOperand(lhs, rhs, unsafeSyms) {
 			return boolConstInstr(false), true
 		}
@@ -1133,19 +1751,77 @@ func evalFoldedOperands(prog *Program, subOp uint16, lhs, rhs IRInstr, isBinary 
 	return IRInstr{}, false
 }
 
-func tryFoldSwitch(prog *Program, ins IRInstr) (InstrID, bool) {
+func tryFoldSwitchInstr(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+	if target, ok := tryFoldSwitch(prog, ins, allocEnv, unsafeSyms); ok && int(target) < len(prog.Instrs) {
+		return prog.Instrs[target], true
+	}
+	if int(ins.Arg0) >= len(prog.Instrs) || uint32(ins.Data) != 1 || int(ins.Arg1+1) >= len(prog.Extra) || int(ins.Aux) >= len(prog.Instrs) {
+		return IRInstr{}, false
+	}
+	caseTag := prog.Extra[ins.Arg1]
+	targetID := InstrID(prog.Extra[ins.Arg1+1])
+	auxID := InstrID(ins.Aux)
+	if (caseTag != 0 && caseTag != 1) || int(targetID) >= len(prog.Instrs) {
+		return IRInstr{}, false
+	}
+	condIns := prog.Instrs[ins.Arg0]
+	thenID, elseID := targetID, auxID
+	if caseTag == 0 {
+		thenID, elseID = auxID, targetID
+	}
+	thenIns := prog.Instrs[thenID]
+	elseIns := prog.Instrs[elseID]
+
+	// if cond then x else x -> x (when cond is pure)
+	if samePureOperand(thenIns, elseIns, unsafeSyms) && isPureExpr(prog, condIns, unsafeSyms) {
+		return thenIns, true
+	}
+
+	// if cond then true else false -> cond; if cond then false else true -> not cond
+	if isKnownBoolExpr(condIns) {
+		if isBoolConstVal(thenIns, true) && isBoolConstVal(elseIns, false) {
+			return condIns, true
+		}
+		if isBoolConstVal(thenIns, false) && isBoolConstVal(elseIns, true) {
+			return IRInstr{Kind: IRPrim, SubOp: PrimNot, Arg0: ins.Arg0, Arg1: uint32(NoInstr)}, true
+		}
+	}
+
+	// if not c then t else f -> if c then f else t
+	if condIns.Kind == IRPrim && condIns.SubOp == PrimNot && int(condIns.Arg0) < len(prog.Instrs) {
+		swappedStart, swappedCount := prog.AddSwitchCases([]SwitchCase{{Tag: caseTag, Target: auxID}})
+		return IRInstr{
+			Kind: IRSwitch,
+			Arg0: condIns.Arg0,
+			Arg1: swappedStart,
+			Aux:  uint32(targetID),
+			Data: uint64(swappedCount),
+		}, true
+	}
+
+	return IRInstr{}, false
+}
+
+func tryFoldSwitch(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) (InstrID, bool) {
 	if int(ins.Arg0) >= len(prog.Instrs) {
 		return NoInstr, false
 	}
 	scrut := prog.Instrs[ins.Arg0]
-	if scrut.Kind != IRConst {
-		return NoInstr, false
+	var tag uint32
+	hasTag := false
+	if scrut.Kind == IRConst && (scrut.SubOp == ConstBool || scrut.SubOp == ConstInt) {
+		tag = uint32(scrut.Data)
+		hasTag = true
+	} else if scrut.Kind == IRLoad && scrut.SubOp == LoadADTTag {
+		if adtIns, ok := resolveKnownAlloc(prog, InstrID(scrut.Arg0), allocEnv, unsafeSyms); ok && adtIns.SubOp == AllocADT {
+			tag = uint32(adtIns.Data)
+			hasTag = true
+		}
 	}
-	if scrut.SubOp != ConstBool && scrut.SubOp != ConstInt {
+	if !hasTag {
 		return NoInstr, false
 	}
 
-	tag := uint32(scrut.Data)
 	count := uint32(ins.Data)
 	for i := uint32(0); i < count; i++ {
 		idx := ins.Arg1 + i*2
