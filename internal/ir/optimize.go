@@ -2,6 +2,7 @@ package ir
 
 import (
 	"math"
+	"strconv"
 	"strings"
 
 	"fml/internal/token"
@@ -32,7 +33,9 @@ func Optimize(prog *Program) {
 		copyEnv := make(map[token.StringID]token.StringID)
 		fnEnv := make(map[token.StringID]IRInstr)
 		allocEnv := make(map[token.StringID]IRInstr)
+		appEnv := make(map[token.StringID]uint32)
 		userSyms := make(map[token.StringID]bool)
+		liveUses, reachable := computeLiveSymbolUsesAndReachable(prog)
 
 		// Collect single-assignment immutable IRLet bindings first so scoped `let ... in body`
 		// bindings (where IRLet has a higher InstrID than body) propagate in a single pass.
@@ -70,6 +73,10 @@ func Optimize(prog *Program) {
 					if isPureExpr(prog, rhs, unsafeSyms) {
 						allocEnv[sym] = rhs
 					}
+				case IRApp:
+					if liveUses[sym] == 1 {
+						appEnv[sym] = ins.Arg0
+					}
 				}
 			}
 		}
@@ -88,7 +95,7 @@ func Optimize(prog *Program) {
 				}
 
 			case IRApp:
-				if inlined, ok := tryInlineApp(prog, ins, fnEnv, allocEnv, userSyms, unsafeSyms); ok {
+				if inlined, ok := tryInlineApp(prog, ins, reachable[InstrID(i)], fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); ok {
 					prog.Instrs[i] = inlined
 					changed = true
 				}
@@ -128,7 +135,8 @@ func Optimize(prog *Program) {
 }
 
 func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
-	bindCounts := make(map[token.StringID]int)
+	letBindCounts := make(map[token.StringID]int)
+	fnParamCounts := make(map[token.StringID]int)
 	unsafe := make(map[token.StringID]bool)
 
 	for _, ins := range prog.Instrs {
@@ -136,7 +144,7 @@ func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
 		case IRLet:
 			sym := token.StringID(ins.Data)
 			if sym != token.NoString {
-				bindCounts[sym]++
+				letBindCounts[sym]++
 				if ins.Flags&(IRFlagMutable|IRFlagRec|IRFlagDispose) != 0 {
 					unsafe[sym] = true
 				}
@@ -144,7 +152,7 @@ func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
 		case IRFn:
 			param := token.StringID(ins.Data)
 			if param != token.NoString {
-				bindCounts[param]++
+				fnParamCounts[param]++
 			}
 		case IRPrim:
 			if ins.SubOp == PrimForIn || ins.SubOp == PrimForTo {
@@ -161,8 +169,8 @@ func collectUnsafeSymbols(prog *Program) map[token.StringID]bool {
 		}
 	}
 
-	for sym, count := range bindCounts {
-		if count > 1 {
+	for sym, count := range letBindCounts {
+		if count+fnParamCounts[sym] > 1 {
 			unsafe[sym] = true
 		}
 	}
@@ -188,7 +196,98 @@ func resolveKnownAlloc(prog *Program, id InstrID, allocEnv map[token.StringID]IR
 	return IRInstr{}, false
 }
 
-func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+func unwindStdlibApp(prog *Program, appIns IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (qualName string, headID InstrID, revArgs []InstrID, ok bool) {
+	if appIns.Kind != IRApp || prog.Strings == nil {
+		return "", NoInstr, nil, false
+	}
+	currApp := appIns
+	for len(revArgs) < 8 {
+		if int(currApp.Arg0) >= len(prog.Instrs) || int(currApp.Arg1) >= len(prog.Instrs) {
+			return "", NoInstr, nil, false
+		}
+		revArgs = append(revArgs, InstrID(currApp.Arg1))
+		nextID := InstrID(currApp.Arg0)
+		nextIns := prog.Instrs[nextID]
+		if nextIns.Kind == IRApp {
+			currApp = nextIns
+			continue
+		}
+		headID = nextID
+		var qSym token.StringID
+		if nextIns.Kind == IRLoad && nextIns.SubOp == LoadRecordField && nextIns.Aux != 0 {
+			qSym = token.StringID(nextIns.Aux)
+		} else if nextIns.Kind == IRVar && nextIns.Data != 0 {
+			qSym = token.StringID(nextIns.Data)
+		}
+		if qSym != token.NoString && !userSyms[qSym] && !unsafeSyms[qSym] {
+			qualName = prog.Strings.String(qSym)
+		}
+		break
+	}
+	if qualName == "" || len(revArgs) == 0 {
+		return "", NoInstr, nil, false
+	}
+	return qualName, headID, revArgs, true
+}
+
+func resolveStdlibApp(prog *Program, id InstrID, allowAppEnv bool, appEnv map[token.StringID]uint32, userSyms, unsafeSyms map[token.StringID]bool) (qualName string, headID InstrID, revArgs []InstrID, consumedSym token.StringID, ok bool) {
+	if id == NoInstr || int(id) >= len(prog.Instrs) {
+		return "", NoInstr, nil, token.NoString, false
+	}
+	ins := prog.Instrs[id]
+	if ins.Kind == IRVar && allowAppEnv && appEnv != nil {
+		sym := token.StringID(ins.Data)
+		if !unsafeSyms[sym] {
+			if rhsIdx, found := appEnv[sym]; found && int(rhsIdx) < len(prog.Instrs) {
+				ins = prog.Instrs[rhsIdx]
+				consumedSym = sym
+			}
+		}
+	}
+	qualName, headID, revArgs, ok = unwindStdlibApp(prog, ins, userSyms, unsafeSyms)
+	if !ok {
+		return "", NoInstr, nil, token.NoString, false
+	}
+	return qualName, headID, revArgs, consumedSym, true
+}
+
+func isPureCallback(prog *Program, fnID InstrID, fnEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool) bool {
+	return isPureCallbackDepth(prog, fnID, fnEnv, unsafeSyms, 0)
+}
+
+func isPureCallbackDepth(prog *Program, fnID InstrID, fnEnv map[token.StringID]IRInstr, unsafeSyms map[token.StringID]bool, depth int) bool {
+	if depth > 8 || fnID == NoInstr || int(fnID) >= len(prog.Instrs) {
+		return false
+	}
+	fnIns := prog.Instrs[fnID]
+	if fnIns.Kind == IRVar {
+		sym := token.StringID(fnIns.Data)
+		if !unsafeSyms[sym] {
+			if fnEnv != nil {
+				if lookedUp, ok := fnEnv[sym]; ok {
+					fnIns = lookedUp
+				}
+			} else {
+				for _, cand := range prog.Instrs {
+					if cand.Kind == IRLet && cand.Flags == 0 && token.StringID(cand.Data) == sym && int(cand.Arg0) < len(prog.Instrs) {
+						fnIns = prog.Instrs[cand.Arg0]
+						break
+					}
+				}
+			}
+		}
+	}
+	if fnIns.Kind != IRFn || int(fnIns.Arg0) >= len(prog.Instrs) {
+		return false
+	}
+	param := token.StringID(fnIns.Data)
+	if param != token.NoString && unsafeSyms[param] {
+		return false
+	}
+	return isPureExprDepth(prog, prog.Instrs[fnIns.Arg0], unsafeSyms, depth+1)
+}
+
+func tryInlineApp(prog *Program, appIns IRInstr, isReachable bool, fnEnv, allocEnv map[token.StringID]IRInstr, appEnv map[token.StringID]uint32, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	if int(appIns.Arg0) >= len(prog.Instrs) || int(appIns.Arg1) >= len(prog.Instrs) {
 		return IRInstr{}, false
 	}
@@ -210,17 +309,20 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.Strin
 	// Unwind curried application spine `f arg0 arg1 ...` (including desugared `|>` pipelines).
 	var revArgs []InstrID
 	currApp := appIns
+	var headID InstrID
 	var headIns IRInstr
 	for len(revArgs) < 8 {
 		if int(currApp.Arg0) >= len(prog.Instrs) || int(currApp.Arg1) >= len(prog.Instrs) {
 			return IRInstr{}, false
 		}
 		revArgs = append(revArgs, InstrID(currApp.Arg1))
-		nextIns := prog.Instrs[currApp.Arg0]
+		nextID := InstrID(currApp.Arg0)
+		nextIns := prog.Instrs[nextID]
 		if nextIns.Kind == IRApp {
 			currApp = nextIns
 			continue
 		}
+		headID = nextID
 		headIns = nextIns
 		break
 	}
@@ -228,7 +330,7 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.Strin
 		return IRInstr{}, false
 	}
 
-	// Option / Result / List stdlib intrinsic fusion on known allocations
+	// Option / Result / List / Array stdlib intrinsic & combinator chain fusion
 	if prog.Strings != nil {
 		var qualName string
 		if headIns.Kind == IRLoad && headIns.SubOp == LoadRecordField && headIns.Aux != 0 {
@@ -243,7 +345,7 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.Strin
 			}
 		}
 		if qualName != "" {
-			if fused, ok := tryFuseStdlibCombinator(prog, qualName, revArgs, fnEnv, allocEnv, userSyms, unsafeSyms); ok {
+			if fused, ok := tryFuseStdlibCombinator(prog, qualName, headID, revArgs, isReachable, fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); ok {
 				return fused, true
 			}
 		}
@@ -313,10 +415,31 @@ func tryInlineApp(prog *Program, appIns IRInstr, fnEnv, allocEnv map[token.Strin
 		}
 	}
 
-	return tryInlineBodyExpr(prog, bodyID, bodyIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms)
+	return tryInlineBodyExpr(prog, bodyID, bodyIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms, 0)
 }
 
-func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToArg map[token.StringID]InstrID, allConstArgs bool, maxParamUses int, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+func resolveInlineOperand(prog *Program, id InstrID, orig IRInstr, paramToArg map[token.StringID]InstrID, allConstArgs bool, maxParamUses int, unsafeSyms map[token.StringID]bool, depth int) (InstrID, IRInstr, bool, bool) {
+	if orig.Kind == IRConst {
+		return id, orig, false, true
+	}
+	if orig.Kind == IRVar {
+		if mapped, ok := paramToArg[token.StringID(orig.Data)]; ok {
+			return mapped, prog.Instrs[mapped], false, true
+		}
+		return id, orig, false, true
+	}
+	if maxParamUses <= 1 && depth < 4 {
+		if inlined, ok := tryInlineBodyExpr(prog, id, orig, paramToArg, allConstArgs, maxParamUses, unsafeSyms, depth+1); ok {
+			return NoInstr, inlined, true, true
+		}
+	}
+	return NoInstr, IRInstr{}, false, false
+}
+
+func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToArg map[token.StringID]InstrID, allConstArgs bool, maxParamUses int, unsafeSyms map[token.StringID]bool, depth int) (IRInstr, bool) {
+	if depth > 4 {
+		return IRInstr{}, false
+	}
 	switch bodyIns.Kind {
 	case IRConst:
 		return bodyIns, true
@@ -338,7 +461,7 @@ func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToAr
 					}
 					return bodyIns, true
 				}
-				if inlinedPayload, ok := tryInlineBodyExpr(prog, InstrID(bodyIns.Arg0), pIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms); ok {
+				if inlinedPayload, ok := tryInlineBodyExpr(prog, InstrID(bodyIns.Arg0), pIns, paramToArg, allConstArgs, maxParamUses, unsafeSyms, depth+1); ok {
 					pID := prog.Emit(inlinedPayload)
 					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(pID), Data: bodyIns.Data}, true
 				}
@@ -350,12 +473,9 @@ func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToAr
 		}
 		origLhs := prog.Instrs[bodyIns.Arg0]
 		if bodyIns.SubOp == PrimNeg || bodyIns.SubOp == PrimNot {
-			if origLhs.Kind == IRConst || origLhs.Kind == IRVar {
-				arg0ID := InstrID(bodyIns.Arg0)
-				if origLhs.Kind == IRVar {
-					if mapped, ok := paramToArg[token.StringID(origLhs.Data)]; ok {
-						arg0ID = mapped
-					}
+			if arg0ID, lhsIns, emitLhs, ok := resolveInlineOperand(prog, InstrID(bodyIns.Arg0), origLhs, paramToArg, allConstArgs, maxParamUses, unsafeSyms, depth); ok {
+				if emitLhs {
+					arg0ID = prog.Emit(lhsIns)
 				}
 				inlined := IRInstr{
 					Kind:  IRPrim,
@@ -379,23 +499,22 @@ func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToAr
 		}
 		origRhs := prog.Instrs[bodyIns.Arg1]
 		if !allConstArgs && (bodyIns.SubOp == PrimDiv || bodyIns.SubOp == PrimMod) {
-			return IRInstr{}, false
-		}
-		if (origLhs.Kind == IRConst || origLhs.Kind == IRVar) && (origRhs.Kind == IRConst || origRhs.Kind == IRVar) {
-			arg0ID := InstrID(bodyIns.Arg0)
-			if origLhs.Kind == IRVar {
-				if mapped, ok := paramToArg[token.StringID(origLhs.Data)]; ok {
-					arg0ID = mapped
-				}
+			if !(origRhs.Kind == IRConst && origRhs.SubOp == ConstInt && int64(origRhs.Data) != 0) {
+				return IRInstr{}, false
 			}
-			arg1ID := InstrID(bodyIns.Arg1)
-			if origRhs.Kind == IRVar {
-				if mapped, ok := paramToArg[token.StringID(origRhs.Data)]; ok {
-					arg1ID = mapped
-				}
+		}
+		arg0ID, lhsIns, emitLhs, okLhs := resolveInlineOperand(prog, InstrID(bodyIns.Arg0), origLhs, paramToArg, allConstArgs, maxParamUses, unsafeSyms, depth)
+		arg1ID, rhsIns, emitRhs, okRhs := resolveInlineOperand(prog, InstrID(bodyIns.Arg1), origRhs, paramToArg, allConstArgs, maxParamUses, unsafeSyms, depth)
+		if okLhs && okRhs {
+			if emitLhs {
+				arg0ID = prog.Emit(lhsIns)
+			}
+			if emitRhs {
+				arg1ID = prog.Emit(rhsIns)
 			}
 			inlined := IRInstr{
 				Kind:  IRPrim,
+				Flags: bodyIns.Flags,
 				SubOp: bodyIns.SubOp,
 				Arg0:  uint32(arg0ID),
 				Arg1:  uint32(arg1ID),
@@ -415,48 +534,85 @@ func tryInlineBodyExpr(prog *Program, bodyID InstrID, bodyIns IRInstr, paramToAr
 	return IRInstr{}, false
 }
 
-func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, fnEnv, allocEnv map[token.StringID]IRInstr, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
+func tryFuseStdlibCombinator(prog *Program, qualName string, headID InstrID, revArgs []InstrID, isReachable bool, fnEnv, allocEnv map[token.StringID]IRInstr, appEnv map[token.StringID]uint32, userSyms, unsafeSyms map[token.StringID]bool) (IRInstr, bool) {
 	switch len(revArgs) {
 	case 1:
 		argID := revArgs[0]
-		allocIns, ok := resolveKnownAlloc(prog, argID, allocEnv, unsafeSyms)
-		if !ok {
-			return IRInstr{}, false
+		if allocIns, ok := resolveKnownAlloc(prog, argID, allocEnv, unsafeSyms); ok {
+			switch qualName {
+			case "Option.isSome":
+				if allocIns.SubOp == AllocADT {
+					tag := prog.Strings.String(token.StringID(allocIns.Data))
+					return boolConstInstr(tag == "Some"), true
+				}
+			case "Option.isNone":
+				if allocIns.SubOp == AllocADT {
+					tag := prog.Strings.String(token.StringID(allocIns.Data))
+					return boolConstInstr(tag == "None"), true
+				}
+			case "Result.isOk":
+				if allocIns.SubOp == AllocADT {
+					tag := prog.Strings.String(token.StringID(allocIns.Data))
+					return boolConstInstr(tag == "Ok"), true
+				}
+			case "Result.isError":
+				if allocIns.SubOp == AllocADT {
+					tag := prog.Strings.String(token.StringID(allocIns.Data))
+					return boolConstInstr(tag == "Error"), true
+				}
+			case "List.isEmpty":
+				if allocIns.SubOp == AllocList {
+					return boolConstInstr(allocIns.Arg1 == 0), true
+				}
+			case "List.length":
+				if allocIns.SubOp == AllocList {
+					return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(allocIns.Arg1)}, true
+				}
+			case "Array.length":
+				if allocIns.SubOp == AllocArray {
+					return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(allocIns.Arg1)}, true
+				}
+			case "List.head":
+				if allocIns.SubOp == AllocList && allocIns.Arg1 > 0 && int(allocIns.Arg0) < len(prog.Extra) {
+					elemID := prog.Extra[allocIns.Arg0]
+					if int(elemID) < len(prog.Instrs) {
+						return prog.Instrs[elemID], true
+					}
+				}
+			}
 		}
-		switch qualName {
-		case "Option.isSome":
-			if allocIns.SubOp == AllocADT {
-				tag := prog.Strings.String(token.StringID(allocIns.Data))
-				return boolConstInstr(tag == "Some"), true
-			}
-		case "Option.isNone":
-			if allocIns.SubOp == AllocADT {
-				tag := prog.Strings.String(token.StringID(allocIns.Data))
-				return boolConstInstr(tag == "None"), true
-			}
-		case "Result.isOk":
-			if allocIns.SubOp == AllocADT {
-				tag := prog.Strings.String(token.StringID(allocIns.Data))
-				return boolConstInstr(tag == "Ok"), true
-			}
-		case "Result.isError":
-			if allocIns.SubOp == AllocADT {
-				tag := prog.Strings.String(token.StringID(allocIns.Data))
-				return boolConstInstr(tag == "Error"), true
-			}
-		case "List.isEmpty":
-			if allocIns.SubOp == AllocList {
-				return boolConstInstr(allocIns.Arg1 == 0), true
-			}
-		case "List.length":
-			if allocIns.SubOp == AllocList {
-				return IRInstr{Kind: IRConst, SubOp: ConstInt, Data: uint64(allocIns.Arg1)}, true
-			}
-		case "List.head":
-			if allocIns.SubOp == AllocList && allocIns.Arg1 > 0 && int(allocIns.Arg0) < len(prog.Extra) {
-				headID := prog.Extra[allocIns.Arg0]
-				if int(headID) < len(prog.Instrs) {
-					return prog.Instrs[headID], true
+
+		if innerQual, _, innerRevArgs, consumedSym, ok := resolveStdlibApp(prog, argID, isReachable, appEnv, userSyms, unsafeSyms); ok {
+			switch qualName {
+			case "List.length", "List.isEmpty":
+				if innerQual == "List.rev" && len(innerRevArgs) == 1 && headID != NoInstr {
+					delete(appEnv, consumedSym)
+					return IRInstr{Kind: IRApp, Arg0: uint32(headID), Arg1: uint32(innerRevArgs[0])}, true
+				}
+				if innerQual == "List.map" && len(innerRevArgs) == 2 && headID != NoInstr &&
+					isPureCallback(prog, innerRevArgs[1], fnEnv, unsafeSyms) {
+					delete(appEnv, consumedSym)
+					return IRInstr{Kind: IRApp, Arg0: uint32(headID), Arg1: uint32(innerRevArgs[0])}, true
+				}
+			case "Array.length":
+				if innerQual == "Array.rev" && len(innerRevArgs) == 1 && headID != NoInstr {
+					delete(appEnv, consumedSym)
+					return IRInstr{Kind: IRApp, Arg0: uint32(headID), Arg1: uint32(innerRevArgs[0])}, true
+				}
+				if innerQual == "Array.map" && len(innerRevArgs) == 2 && headID != NoInstr &&
+					isPureCallback(prog, innerRevArgs[1], fnEnv, unsafeSyms) {
+					delete(appEnv, consumedSym)
+					return IRInstr{Kind: IRApp, Arg0: uint32(headID), Arg1: uint32(innerRevArgs[0])}, true
+				}
+			case "List.rev":
+				if innerQual == "List.rev" && len(innerRevArgs) == 1 && int(innerRevArgs[0]) < len(prog.Instrs) {
+					delete(appEnv, consumedSym)
+					return prog.Instrs[innerRevArgs[0]], true
+				}
+			case "Array.rev":
+				if innerQual == "Array.rev" && len(innerRevArgs) == 1 && int(innerRevArgs[0]) < len(prog.Instrs) {
+					delete(appEnv, consumedSym)
+					return prog.Instrs[innerRevArgs[0]], true
 				}
 			}
 		}
@@ -468,10 +624,50 @@ func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, 
 			return IRInstr{}, false
 		}
 		firstIns := prog.Instrs[firstArg]
-		adtIns, ok := resolveKnownAlloc(prog, secondArg, allocEnv, unsafeSyms)
-		if !ok || adtIns.SubOp != AllocADT {
+
+		switch qualName {
+		case "List.map", "Array.map", "Option.map", "Result.map":
+			if innerQual, _, innerRevArgs, consumedSym, ok := resolveStdlibApp(prog, secondArg, isReachable, appEnv, userSyms, unsafeSyms); ok &&
+				innerQual == qualName && len(innerRevArgs) == 2 && headID != NoInstr {
+				innerFn := innerRevArgs[1]
+				innerSrc := innerRevArgs[0]
+				if isPureCallback(prog, firstArg, fnEnv, unsafeSyms) && isPureCallback(prog, innerFn, fnEnv, unsafeSyms) {
+					delete(appEnv, consumedSym)
+					paramSym := prog.Strings.InternString("__fuse_" + strconv.Itoa(len(prog.Instrs)))
+					varRef := prog.Emit(IRInstr{Kind: IRVar, Data: uint64(paramSym)})
+					innerAppIns := IRInstr{Kind: IRApp, Arg0: uint32(innerFn), Arg1: uint32(varRef)}
+					if inlined, okIn := tryInlineApp(prog, innerAppIns, false, fnEnv, allocEnv, nil, userSyms, unsafeSyms); okIn {
+						innerAppIns = inlined
+					}
+					innerAppID := prog.Emit(innerAppIns)
+					outerAppIns := IRInstr{Kind: IRApp, Flags: IRFlagTailCall, Arg0: uint32(firstArg), Arg1: uint32(innerAppID)}
+					if inlined, okOut := tryInlineApp(prog, outerAppIns, false, fnEnv, allocEnv, nil, userSyms, unsafeSyms); okOut {
+						outerAppIns = inlined
+					}
+					outerAppID := prog.Emit(outerAppIns)
+					composedFnID := prog.Emit(IRInstr{
+						Kind: IRFn,
+						Arg0: uint32(outerAppID),
+						Arg1: uint32(NoInstr),
+						Data: uint64(paramSym),
+					})
+					partAppID := prog.Emit(IRInstr{Kind: IRApp, Arg0: uint32(headID), Arg1: uint32(composedFnID)})
+					return IRInstr{Kind: IRApp, Arg0: uint32(partAppID), Arg1: uint32(innerSrc)}, true
+				}
+			}
+		}
+
+		allocIns, ok := resolveKnownAlloc(prog, secondArg, allocEnv, unsafeSyms)
+		if !ok {
 			return IRInstr{}, false
 		}
+		if qualName == "List.map" && allocIns.SubOp == AllocList && allocIns.Arg1 == 0 && isPureCallback(prog, firstArg, fnEnv, unsafeSyms) {
+			return allocIns, true
+		}
+		if allocIns.SubOp != AllocADT {
+			return IRInstr{}, false
+		}
+		adtIns := allocIns
 		tag := prog.Strings.String(token.StringID(adtIns.Data))
 		switch qualName {
 		case "Option.defaultValue":
@@ -505,7 +701,7 @@ func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, 
 		case "Option.bind":
 			if tag == "Some" && InstrID(adtIns.Arg0) != NoInstr {
 				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
-				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+				if inlined, okIn := tryInlineApp(prog, app, isReachable, fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); okIn {
 					return inlined, true
 				}
 				return app, true
@@ -516,7 +712,7 @@ func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, 
 		case "Result.bind":
 			if tag == "Ok" && InstrID(adtIns.Arg0) != NoInstr {
 				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
-				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+				if inlined, okIn := tryInlineApp(prog, app, isReachable, fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); okIn {
 					return inlined, true
 				}
 				return app, true
@@ -530,7 +726,7 @@ func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, 
 			}
 			if tag == "Some" && InstrID(adtIns.Arg0) != NoInstr {
 				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
-				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+				if inlined, okIn := tryInlineApp(prog, app, isReachable, fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); okIn {
 					valID := prog.Emit(inlined)
 					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(valID), Data: adtIns.Data}, true
 				}
@@ -541,7 +737,7 @@ func tryFuseStdlibCombinator(prog *Program, qualName string, revArgs []InstrID, 
 			}
 			if tag == "Ok" && InstrID(adtIns.Arg0) != NoInstr {
 				app := IRInstr{Kind: IRApp, Arg0: uint32(firstArg), Arg1: adtIns.Arg0}
-				if inlined, okIn := tryInlineApp(prog, app, fnEnv, allocEnv, userSyms, unsafeSyms); okIn {
+				if inlined, okIn := tryInlineApp(prog, app, isReachable, fnEnv, allocEnv, appEnv, userSyms, unsafeSyms); okIn {
 					valID := prog.Emit(inlined)
 					return IRInstr{Kind: IRAlloc, SubOp: AllocADT, Arg0: uint32(valID), Data: adtIns.Data}, true
 				}
@@ -918,13 +1114,24 @@ func tryFoldLoad(prog *Program, ins IRInstr, allocEnv map[token.StringID]IRInstr
 	case LoadRecordField:
 		if srcIns.SubOp == AllocRecord {
 			wantField := uint32(ins.Data)
-			for j := uint32(0); j+1 < srcIns.Arg1; j += 2 {
-				if int(srcIns.Arg0+j+1) < len(prog.Extra) && prog.Extra[srcIns.Arg0+j] == wantField {
-					valID := prog.Extra[srcIns.Arg0+j+1]
-					if int(valID) < len(prog.Instrs) {
-						return prog.Instrs[valID], true
+			cur := srcIns
+			for depth := 0; depth < 8 && cur.Kind == IRAlloc && cur.SubOp == AllocRecord; depth++ {
+				for j := uint32(0); j+1 < cur.Arg1; j += 2 {
+					if int(cur.Arg0+j+1) < len(prog.Extra) && prog.Extra[cur.Arg0+j] == wantField {
+						valID := prog.Extra[cur.Arg0+j+1]
+						if int(valID) < len(prog.Instrs) {
+							return prog.Instrs[valID], true
+						}
 					}
 				}
+				if cur.Flags == 0 {
+					break
+				}
+				baseIns, ok := resolveKnownAlloc(prog, InstrID(cur.Aux), allocEnv, unsafeSyms)
+				if !ok {
+					break
+				}
+				cur = baseIns
 			}
 		}
 	case LoadADTTag:
@@ -1016,7 +1223,7 @@ func isPureExprDepth(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]b
 				return true
 			}
 			return int(ins.Arg0) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1)
-		case AllocTuple, AllocList:
+		case AllocTuple, AllocList, AllocArray:
 			for i := uint32(0); i < ins.Arg1; i++ {
 				idx := ins.Arg0 + i
 				if int(idx) >= len(prog.Extra) || int(prog.Extra[idx]) >= len(prog.Instrs) ||
@@ -1027,7 +1234,9 @@ func isPureExprDepth(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]b
 			return true
 		case AllocRecord:
 			if ins.Flags != 0 {
-				return false
+				if int(ins.Aux) >= len(prog.Instrs) || !isPureExprDepth(prog, prog.Instrs[ins.Aux], unsafeSyms, depth+1) {
+					return false
+				}
 			}
 			for i := uint32(0); i+1 < ins.Arg1; i += 2 {
 				valIdx := ins.Arg0 + i + 1
@@ -1043,11 +1252,34 @@ func isPureExprDepth(prog *Program, ins IRInstr, unsafeSyms map[token.StringID]b
 		case LoadTupleElem, LoadRecordField, LoadADTPayload, LoadADTTag, LoadListHead, LoadListTail, LoadListIsEmpty:
 			return int(ins.Arg0) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[ins.Arg0], unsafeSyms, depth+1)
 		}
+	case IRApp:
+		if qualName, _, revArgs, ok := unwindStdlibApp(prog, ins, nil, unsafeSyms); ok {
+			switch len(revArgs) {
+			case 1:
+				switch qualName {
+				case "Option.isSome", "Option.isNone", "Result.isOk", "Result.isError",
+					"List.isEmpty", "List.length", "List.rev", "Array.length", "Array.rev":
+					return int(revArgs[0]) < len(prog.Instrs) && isPureExprDepth(prog, prog.Instrs[revArgs[0]], unsafeSyms, depth+1)
+				}
+			case 2:
+				switch qualName {
+				case "List.map", "Array.map", "Option.map", "Result.map", "List.filter", "Array.filter":
+					return int(revArgs[0]) < len(prog.Instrs) && int(revArgs[1]) < len(prog.Instrs) &&
+						isPureExprDepth(prog, prog.Instrs[revArgs[0]], unsafeSyms, depth+1) &&
+						isPureCallbackDepth(prog, revArgs[1], nil, unsafeSyms, depth+1)
+				}
+			}
+		}
 	}
 	return false
 }
 
 func computeLiveSymbolUses(prog *Program) map[token.StringID]int {
+	uses, _ := computeLiveSymbolUsesAndReachable(prog)
+	return uses
+}
+
+func computeLiveSymbolUsesAndReachable(prog *Program) (map[token.StringID]int, map[InstrID]bool) {
 	uses := make(map[token.StringID]int)
 	visited := make(map[InstrID]bool)
 	markReachableUses(prog, prog.Root, uses, visited)
@@ -1063,7 +1295,7 @@ func computeLiveSymbolUses(prog *Program) map[token.StringID]int {
 			}
 		}
 	}
-	return uses
+	return uses, visited
 }
 
 func markReachableUses(prog *Program, id InstrID, uses map[token.StringID]int, visited map[InstrID]bool) {

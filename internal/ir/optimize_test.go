@@ -303,6 +303,95 @@ fun (x: int) ->
 	}
 }
 
+func TestCombinatorChainFusionAndRecordUpdateProjection(t *testing.T) {
+	// 1. Verify record copy-and-update (`{ r with ... }`) field projection forwarding
+	// (both overridden and inherited fields across chains) and length/isEmpty/rev
+	// combinator elimination over List.map, List.rev, Array.map, and Array.rev.
+	srcConst := []byte(`
+let r0 = { x = 10; y = 20; z = 30 }
+let r1 = { r0 with y = 200 }
+let r2 = { r1 with z = 300 }
+let recSum = r2.x + r2.y + r2.z
+
+let xs = [1; 2; 3; 4]
+let mappedList = List.map (fun x -> x + 1) (List.rev xs)
+let listLen = List.length mappedList
+let listNotEmpty = not (List.isEmpty (List.map (fun x -> x * 2) xs))
+let revTwiceHead = List.head (List.rev (List.rev [7; 8; 9]))
+
+let arr = [| 10; 20; 30 |]
+let mappedArr = Array.map (fun x -> x * 3) (Array.rev arr)
+let arrLen = Array.length mappedArr
+
+if listNotEmpty then
+    recSum + listLen + revTwiceHead + arrLen
+else
+    0
+`)
+	p, root, err := parser.ParseSource(srcConst, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	chk := types.NewChecker(p.Arena, nil)
+	if _, err := chk.Infer(root); err != nil {
+		t.Fatalf("infer failed: %v", err)
+	}
+	prog := Lower(p.Arena, chk.Types, root)
+	Optimize(prog)
+
+	// recSum = 10 + 200 + 300 = 510
+	// listLen = 4, revTwiceHead = 7, arrLen = 3
+	// total = 510 + 4 + 7 + 3 = 524
+	rootInstr := prog.Instrs[prog.Root]
+	if rootInstr.Kind != IRConst || rootInstr.SubOp != ConstInt || int64(rootInstr.Data) != 524 {
+		t.Fatalf("expected record update projection & combinator length/rev folding to produce IRConst(524), got %+v", rootInstr)
+	}
+
+	// 2. Verify multi-stage List.map pipeline (`xs |> List.map f |> List.map g |> List.map h`)
+	// fuses into a single `List.map` call with a beta-reduced composed callback body.
+	srcPipe := []byte(`
+fun xs ->
+    let step1 = xs |> List.map (fun x -> x + 1) in
+    let step2 = step1 |> List.map (fun y -> y * 2) in
+    step2 |> List.map (fun z -> z - 3)
+`)
+	p2, root2, err := parser.ParseSource(srcPipe, nil)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	chk2 := types.NewChecker(p2.Arena, nil)
+	if _, err := chk2.Infer(root2); err != nil {
+		t.Fatalf("infer failed: %v", err)
+	}
+	prog2 := Lower(p2.Arena, chk2.Types, root2)
+	Optimize(prog2)
+
+	outerFn := prog2.Instrs[prog2.Root]
+	if outerFn.Kind != IRFn {
+		t.Fatalf("expected outer IRFn at root, got %+v", outerFn)
+	}
+	qualName, _, revArgs, ok := unwindStdlibApp(prog2, prog2.Instrs[outerFn.Arg0], nil, nil)
+	if !ok || qualName != "List.map" || len(revArgs) != 2 {
+		t.Fatalf("expected outer body to fuse into a single List.map application, got qual=%q args=%d (%+v)",
+			qualName, len(revArgs), prog2.Instrs[outerFn.Arg0])
+	}
+	// Source operand of the fused List.map must be IRVar(xs) directly.
+	srcArg := prog2.Instrs[revArgs[0]]
+	if srcArg.Kind != IRVar || srcArg.Data != outerFn.Data {
+		t.Fatalf("expected fused List.map source argument to be IRVar(xs), got %+v", srcArg)
+	}
+	// Fused callback must be an IRFn whose body is a pure IRPrim (`((x + 1) * 2) - 3`), with no inner IRApp!
+	cbFn := prog2.Instrs[revArgs[1]]
+	if cbFn.Kind != IRFn {
+		t.Fatalf("expected fused callback to be IRFn, got %+v", cbFn)
+	}
+	cbBody := prog2.Instrs[cbFn.Arg0]
+	if cbBody.Kind != IRPrim || cbBody.SubOp != PrimSub {
+		t.Fatalf("expected fused callback body to beta-reduce to IRPrim(PrimSub), got %+v", cbBody)
+	}
+}
+
+
 
 
 
