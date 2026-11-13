@@ -554,3 +554,99 @@ else
 	}
 }
 
+func TestAOTTupleRecordOptionAndResultUnboxing(t *testing.T) {
+	src := `
+type Vec2 = { X: int; Y: int }
+
+let divModPair (a: int) (b: int) =
+    (a / b, a % b)
+
+let shiftVec (dx: int) (dy: int) =
+    { X = dx + 10; Y = dy + 20 }
+
+let safeDivOpt (a: int) (b: int) =
+    if b == 0 then
+        None
+    else
+        Some (a / b)
+
+let safeDivRes (a: int) (b: int) =
+    if b == 0 then
+        Error "div_zero"
+    else
+        Ok (a / b)
+
+let computeComposite (x: int) (y: int) =
+    let (q, r) = divModPair x y
+    let v = shiftVec q r
+    let opt = safeDivOpt (v.X + v.Y) 2
+    let base =
+        match opt with
+        | Some n -> n + Option.defaultValue 0 opt
+        | None -> -1
+    let res = safeDivRes base 2
+    let extra =
+        match res with
+        | Ok k ->
+            if Result.isOk res && Option.isSome opt then
+                k + Result.defaultValue 0 res
+            else
+                0
+        | Error _ -> -100
+    base + extra
+
+printfn (computeComposite 23 5)
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_composite_unbox.fml")
+	binPath := filepath.Join(tmpDir, "native_composite_unbox_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for divModPair",
+		"(p_0 int64, p_1 int64) (int64, int64)",
+		"// Native unboxed Go function for shiftVec",
+		"// Native unboxed Go function for safeDivOpt",
+		"// Native unboxed Go function for safeDivRes",
+		"(p_0 int64, p_1 int64) (int64, int64, string)",
+		"// Native unboxed Go function for computeComposite",
+		"switch uint32(",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	// divModPair 23 5 -> (4, 3)
+	// shiftVec 4 3 -> { X = 14; Y = 23 }
+	// v.X + v.Y = 37; safeDivOpt 37 2 -> Some 18
+	// base = 18 + 18 = 36
+	// safeDivRes 36 2 -> Ok 18
+	// extra = 18 + 18 = 36
+	// base + extra = 72
+	if got := strings.TrimSpace(string(out)); got != "72" {
+		t.Fatalf("expected '72', got %q", got)
+	}
+}
+
+
