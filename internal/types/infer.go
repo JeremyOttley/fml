@@ -194,6 +194,8 @@ func (c *Checker) registerCombinatorTypes() {
 	zipPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: zipStart, Right: zipCount})
 	partStart, partCount := c.Types.AddExtra([]TypeID{listOf(a), listOf(a)})
 	partPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: partStart, Right: partCount})
+	grpStart, grpCount := c.Types.AddExtra([]TypeID{b, listOf(a)})
+	grpPairTy := c.Types.Add(TypeNode{Kind: TyTuple, Left: grpStart, Right: grpCount})
 	c.define(s.InternString("List.empty"), TypeScheme{Vars: []TypeID{a}, Body: listOf(a)}, false)
 	c.define(s.InternString("List.isEmpty"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), TypeBool)}, false)
 	c.define(s.InternString("List.length"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), TypeInt)}, false)
@@ -212,6 +214,12 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("List.partition"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(listOf(a), partPairTy))}, false)
 	c.define(s.InternString("List.choose"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, optOf(b)), arrow(listOf(a), listOf(b)))}, false)
 	c.define(s.InternString("List.collect"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, listOf(b)), arrow(listOf(a), listOf(b)))}, false)
+	c.define(s.InternString("List.init"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(arrow(TypeInt, a), listOf(a)))}, false)
+	c.define(s.InternString("List.distinct"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), listOf(a))}, false)
+	c.define(s.InternString("List.distinctBy"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(listOf(a), listOf(a)))}, false)
+	c.define(s.InternString("List.groupBy"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(listOf(a), listOf(grpPairTy)))}, false)
+	c.define(s.InternString("List.chunkBySize"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(listOf(a), listOf(listOf(a))))}, false)
+	c.define(s.InternString("List.windowed"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(listOf(a), listOf(listOf(a))))}, false)
 
 	// Array combinators
 	c.define(s.InternString("Array.length"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), TypeInt)}, false)
@@ -222,6 +230,16 @@ func (c *Checker) registerCombinatorTypes() {
 	c.define(s.InternString("Array.fold"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, arrow(b, a)), arrow(a, arrow(arrOf(b), a)))}, false)
 	c.define(s.InternString("Array.ofList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(listOf(a), arrOf(a))}, false)
 	c.define(s.InternString("Array.toList"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), listOf(a))}, false)
+	c.define(s.InternString("Array.init"), TypeScheme{Vars: []TypeID{a}, Body: arrow(TypeInt, arrow(arrow(TypeInt, a), arrOf(a)))}, false)
+	c.define(s.InternString("Array.find"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(arrOf(a), a))}, false)
+	c.define(s.InternString("Array.tryFind"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(arrOf(a), optOf(a)))}, false)
+	c.define(s.InternString("Array.exists"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(arrOf(a), TypeBool))}, false)
+	c.define(s.InternString("Array.forall"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrow(a, TypeBool), arrow(arrOf(a), TypeBool))}, false)
+	c.define(s.InternString("Array.sort"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrOf(a))}, false)
+	c.define(s.InternString("Array.sortBy"), TypeScheme{Vars: []TypeID{a, b}, Body: arrow(arrow(a, b), arrow(arrOf(a), arrOf(a)))}, false)
+	c.define(s.InternString("Array.rev"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrOf(a))}, false)
+	c.define(s.InternString("Array.append"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrow(arrOf(a), arrOf(a)))}, false)
+	c.define(s.InternString("Array.sub"), TypeScheme{Vars: []TypeID{a}, Body: arrow(arrOf(a), arrow(TypeInt, arrow(TypeInt, arrOf(a))))}, false)
 
 	// Seq combinators
 	c.define(s.InternString("Seq.empty"), TypeScheme{Vars: []TypeID{a}, Body: seqOf(a)}, false)

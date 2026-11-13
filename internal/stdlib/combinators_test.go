@@ -279,4 +279,51 @@ v1 + v2 + v3 + List.sum optList
 	}
 }
 
+func TestListAndArrayAdvancedCombinators(t *testing.T) {
+	src := `
+let inited = List.init 4 (fun i -> (i + 1) * 10)
+let dist = List.distinct [1; 2; 2; 3; 1; 4]
+let distBy = List.distinctBy (fun x -> x % 3) [1; 4; 2; 5; 3]
+let grouped = List.groupBy (fun x -> x % 2) [1; 2; 3; 4; 5]
+let chunks = List.chunkBySize 2 [1; 2; 3; 4; 5]
+let windows = List.windowed 3 [1; 2; 3; 4]
+
+let arrInit = Array.init 4 (fun i -> (4 - i) * 10)
+let arrSorted = Array.sort arrInit
+let arrSortedBy = Array.sortBy (fun x -> 0 - x) arrSorted
+let arrRev = Array.rev arrSorted
+let arrApp = Array.append [| 1; 2 |] [| 3; 4 |]
+let arrSub = Array.sub arrApp 1 2
+let arrFound = Array.find (fun x -> x > 25) arrSorted
+let arrTryFound = Array.tryFind (fun x -> x == 20) arrSorted |> Option.defaultValue 0
+let arrTryMissing = Array.tryFind (fun x -> x == 99) arrSorted
+let arrHas30 = Array.exists (fun x -> x == 30) arrSorted
+let arrAllPos = Array.forall (fun x -> x > 0) arrSorted
+
+let chunkSums = List.map List.sum chunks |> List.sum
+let winSums = List.map List.sum windows |> List.sum
+let grpCount = List.length grouped
+
+if (Option.isNone arrTryMissing) && arrHas30 && arrAllPos && (Array.get arrSorted 0 == 10) && (Array.get arrSortedBy 0 == 40) && (Array.get arrRev 0 == 40) then
+    List.sum inited + List.sum dist + List.sum distBy + chunkSums + winSums + grpCount + arrFound + arrTryFound + Array.get arrSub 0 + Array.get arrSub 1
+else
+    0
+`
+	val := evalFML(t, src)
+	// inited = [10; 20; 30; 40] -> 100
+	// dist = [1; 2; 3; 4] -> 10
+	// distBy = [1; 2; 3] -> 6
+	// chunkSums = (1+2) + (3+4) + 5 = 15
+	// winSums = (1+2+3) + (2+3+4) = 15
+	// grpCount = 2
+	// arrFound = 30
+	// arrTryFound = 20
+	// arrSub = [| 2; 3 |] -> 2 + 3 = 5
+	// Total = 100 + 10 + 6 + 15 + 15 + 2 + 30 + 20 + 5 = 203
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 203 {
+		t.Fatalf("expected 203 from advanced List/Array combinators, got %v", val)
+	}
+}
+
+
 
