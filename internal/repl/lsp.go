@@ -169,6 +169,12 @@ type lspSelectionRange struct {
 	Parent *lspSelectionRange `json:"parent,omitempty"`
 }
 
+type lspDocumentLink struct {
+	Range   lspRange `json:"range"`
+	Target  string   `json:"target,omitempty"`
+	Tooltip string   `json:"tooltip,omitempty"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -260,6 +266,9 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"callHierarchyProvider":      true,
 				"documentHighlightProvider":  true,
 				"selectionRangeProvider":     true,
+				"documentLinkProvider": map[string]any{
+					"resolveProvider": false,
+				},
 				"codeLensProvider": map[string]any{
 					"resolveProvider": false,
 				},
@@ -560,6 +569,17 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			selRanges := s.computeSelectionRanges(params.TextDocument.URI, params.Positions)
 			s.sendResponse(msg.ID, selRanges)
+		}
+
+	case "textDocument/documentLink":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			links := s.computeDocumentLinks(params.TextDocument.URI)
+			s.sendResponse(msg.ID, links)
 		}
 
 	case "shutdown":
@@ -1298,6 +1318,7 @@ func (s *LSPServer) computeCodeActions(uri string, rng lspRange) []lspCodeAction
 
 	toks := p.Tokens()
 	src := p.Source()
+	lines := strings.Split(text, "\n")
 	filterRange := rng.End.Line > 0 || rng.End.Character > 0
 
 	paramNodeIDs := make(map[ast.NodeID]bool)
@@ -1445,11 +1466,75 @@ func (s *LSPServer) computeCodeActions(uri string, rng lspRange) []lspCodeAction
 					},
 				})
 			}
+
+			// 3. Inline immutable variable (`refactor.inline`)
+			lhsID := ast.NodeID(n.Left)
+			if n.Kind == ast.KindLet && identUses[sym] > 0 && lhsID != ast.NoNode && p.Arena.Get(lhsID).Kind != ast.KindLambda &&
+				declLine >= 0 && declLine < len(lines) {
+				lineStr := lines[declLine]
+				eqIdx := -1
+				for i := nameTokIdx + 1; i < len(toks); i++ {
+					if int(toks[i].Line)-1 != declLine {
+						break
+					}
+					if toks[i].Kind == token.TokenAssign {
+						eqIdx = i
+						break
+					}
+				}
+				if eqIdx >= 0 {
+					eqCol := int(toks[eqIdx].Col)
+					if eqCol > 0 && eqCol <= len(lineStr) {
+						rhsText := strings.TrimSpace(lineStr[eqCol:])
+						rhsText = strings.TrimSuffix(rhsText, " in")
+						rhsText = strings.TrimSpace(rhsText)
+						if rhsText != "" && !strings.HasPrefix(rhsText, "fun ") && !strings.HasPrefix(rhsText, "match ") {
+							subText := rhsText
+							if strings.ContainsAny(rhsText, " +-*/<>|&") && !(strings.HasPrefix(rhsText, "(") && strings.HasSuffix(rhsText, ")")) {
+								subText = "(" + rhsText + ")"
+							}
+							var inlineEdits []lspTextEdit
+							declEndPos := lspPosition{Line: declLine, Character: len(lineStr)}
+							if declLine+1 < len(lines) {
+								declEndPos = lspPosition{Line: declLine + 1, Character: 0}
+							}
+							inlineEdits = append(inlineEdits, lspTextEdit{
+								Range: lspRange{
+									Start: lspPosition{Line: declLine, Character: 0},
+									End:   declEndPos,
+								},
+								NewText: "",
+							})
+							for i := eqIdx + 1; i < len(toks); i++ {
+								if int(toks[i].Line)-1 == declLine {
+									continue
+								}
+								if toks[i].Kind == token.TokenIdent && string(toks[i].Slice(src)) == symName {
+									inlineEdits = append(inlineEdits, lspTextEdit{
+										Range:   tokenIdxRange(toks, i, len(symName)),
+										NewText: subText,
+									})
+								}
+							}
+							if len(inlineEdits) > 1 {
+								actions = append(actions, lspCodeAction{
+									Title: fmt.Sprintf("Inline variable '%s'", symName),
+									Kind:  "refactor.inline",
+									Edit: &lspWorkspaceEdit{
+										Changes: map[string][]lspTextEdit{
+											uri: inlineEdits,
+										},
+									},
+								})
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
-	// 3. Extract selected expression to local variable (`refactor.extract`)
-	lines := strings.Split(text, "\n")
+	// 4. Extract selected expression to local variable (`refactor.extract`)
 	if rng.Start != rng.End && rng.Start.Line == rng.End.Line && rng.Start.Line >= 0 && rng.Start.Line < len(lines) {
 		line := lines[rng.Start.Line]
 		if rng.Start.Character >= 0 && rng.End.Character <= len(line) && rng.Start.Character < rng.End.Character {
@@ -1478,6 +1563,83 @@ func (s *LSPServer) computeCodeActions(uri string, rng lspRange) []lspCodeAction
 						},
 					},
 				})
+			}
+		}
+	}
+
+	// 5. Convert `if/else` <-> `match` (`refactor.rewrite`)
+	startLine := 0
+	endLine := len(lines) - 1
+	if filterRange {
+		startLine = max(0, rng.Start.Line)
+		endLine = min(len(lines)-1, rng.End.Line)
+	}
+	for lineIdx := startLine; lineIdx <= endLine; lineIdx++ {
+		lineStr := lines[lineIdx]
+		if ifIdx := strings.Index(lineStr, "if "); ifIdx >= 0 &&
+			(ifIdx == 0 || lineStr[ifIdx-1] == ' ' || lineStr[ifIdx-1] == '\t' || lineStr[ifIdx-1] == '=' || lineStr[ifIdx-1] == '(') {
+			thenIdx := strings.Index(lineStr[ifIdx:], " then ")
+			if thenIdx > 3 {
+				thenAbs := ifIdx + thenIdx
+				elseIdx := strings.Index(lineStr[thenAbs:], " else ")
+				if elseIdx > 6 {
+					elseAbs := thenAbs + elseIdx
+					condStr := strings.TrimSpace(lineStr[ifIdx+3 : thenAbs])
+					thenStr := strings.TrimSpace(lineStr[thenAbs+6 : elseAbs])
+					elseStr := strings.TrimSpace(lineStr[elseAbs+6:])
+					if condStr != "" && thenStr != "" && elseStr != "" {
+						actions = append(actions, lspCodeAction{
+							Title: "Convert 'if/else' to 'match'",
+							Kind:  "refactor.rewrite",
+							Edit: &lspWorkspaceEdit{
+								Changes: map[string][]lspTextEdit{
+									uri: {
+										{
+											Range: lspRange{
+												Start: lspPosition{Line: lineIdx, Character: ifIdx},
+												End:   lspPosition{Line: lineIdx, Character: len(lineStr)},
+											},
+											NewText: fmt.Sprintf("match %s with | true -> %s | false -> %s", condStr, thenStr, elseStr),
+										},
+									},
+								},
+							},
+						})
+					}
+				}
+			}
+		}
+		if matchIdx := strings.Index(lineStr, "match "); matchIdx >= 0 &&
+			(matchIdx == 0 || lineStr[matchIdx-1] == ' ' || lineStr[matchIdx-1] == '\t' || lineStr[matchIdx-1] == '=' || lineStr[matchIdx-1] == '(') {
+			withIdx := strings.Index(lineStr[matchIdx:], " with | true -> ")
+			if withIdx > 6 {
+				withAbs := matchIdx + withIdx
+				falseIdx := strings.Index(lineStr[withAbs:], " | false -> ")
+				if falseIdx > 16 {
+					falseAbs := withAbs + falseIdx
+					condStr := strings.TrimSpace(lineStr[matchIdx+6 : withAbs])
+					thenStr := strings.TrimSpace(lineStr[withAbs+16 : falseAbs])
+					elseStr := strings.TrimSpace(lineStr[falseAbs+12:])
+					if condStr != "" && thenStr != "" && elseStr != "" {
+						actions = append(actions, lspCodeAction{
+							Title: "Convert 'match' to 'if/else'",
+							Kind:  "refactor.rewrite",
+							Edit: &lspWorkspaceEdit{
+								Changes: map[string][]lspTextEdit{
+									uri: {
+										{
+											Range: lspRange{
+												Start: lspPosition{Line: lineIdx, Character: matchIdx},
+												End:   lspPosition{Line: lineIdx, Character: len(lineStr)},
+											},
+											NewText: fmt.Sprintf("if %s then %s else %s", condStr, thenStr, elseStr),
+										},
+									},
+								},
+							},
+						})
+					}
+				}
 			}
 		}
 	}
@@ -2491,6 +2653,79 @@ func (s *LSPServer) computeSelectionRanges(uri string, positions []lspPosition) 
 		}
 	}
 	return out
+}
+
+func (s *LSPServer) computeDocumentLinks(uri string) []lspDocumentLink {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return nil
+	}
+	dirPrefix := "file:///"
+	if slashIdx := strings.LastIndex(uri, "/"); slashIdx >= 0 {
+		dirPrefix = uri[:slashIdx+1]
+	}
+
+	var links []lspDocumentLink
+	lines := strings.Split(text, "\n")
+	for lineIdx, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "open ") {
+			modName := strings.TrimSpace(trimmed[len("open "):])
+			if modName != "" && !strings.ContainsAny(modName, " \t") {
+				col := strings.Index(line, modName)
+				if col >= 0 {
+					target := dirPrefix + strings.ToLower(modName) + ".fml"
+					for docURI := range s.Docs {
+						if strings.HasSuffix(docURI, "/"+modName+".fml") ||
+							strings.HasSuffix(docURI, "/"+strings.ToLower(modName)+".fml") {
+							target = docURI
+							break
+						}
+					}
+					links = append(links, lspDocumentLink{
+						Range: lspRange{
+							Start: lspPosition{Line: lineIdx, Character: col},
+							End:   lspPosition{Line: lineIdx, Character: col + len(modName)},
+						},
+						Target:  target,
+						Tooltip: "Open module " + modName,
+					})
+				}
+			}
+		}
+	}
+
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return links
+	}
+	toks := p.Tokens()
+	src := p.Source()
+	for i, tk := range toks {
+		if tk.Kind != token.TokenString {
+			continue
+		}
+		raw := string(tk.Slice(src))
+		val := strings.Trim(raw, "\"")
+		if strings.HasSuffix(val, ".fml") {
+			target := val
+			if !strings.HasPrefix(target, "file://") {
+				target = dirPrefix + strings.TrimPrefix(target, "./")
+			}
+			links = append(links, lspDocumentLink{
+				Range:   tokenIdxRange(toks, i, len(raw)),
+				Target:  target,
+				Tooltip: "Open " + val,
+			})
+		} else if strings.HasPrefix(val, "http://") || strings.HasPrefix(val, "https://") {
+			links = append(links, lspDocumentLink{
+				Range:   tokenIdxRange(toks, i, len(raw)),
+				Target:  val,
+				Tooltip: "Open URL " + val,
+			})
+		}
+	}
+	return links
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {

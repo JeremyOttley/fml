@@ -550,6 +550,50 @@ func TestLSPDocumentHighlightSelectionRangeAndExtractAction(t *testing.T) {
 	}
 }
 
+func TestLSPInlineVariableIfToMatchAndDocumentLinks(t *testing.T) {
+	doc := strings.Join([]string{
+		"open Utils",
+		"let cfgPath = \"./config.fml\"",
+		"let step = 10 + 5",
+		"let res = if step > 10 then step * 2 else 0",
+		"let back = match step > 5 with | true -> 1 | false -> 2",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///app/main.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/documentLink","params":{"textDocument":{"uri":"file:///app/main.fml"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///app/main.fml"},"range":{"start":{"line":2,"character":0},"end":{"line":4,"character":55}}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"documentLinkProvider":{"resolveProvider":false}`,
+		`"target":"file:///app/utils.fml","tooltip":"Open module Utils"`,
+		`"target":"file:///app/config.fml","tooltip":"Open ./config.fml"`,
+		`"title":"Inline variable 'step'"`,
+		`"kind":"refactor.inline"`,
+		`"newText":"(10 + 5)"`,
+		`"title":"Convert 'if/else' to 'match'"`,
+		`"newText":"match step > 10 with | true -> step * 2 | false -> 0"`,
+		`"title":"Convert 'match' to 'if/else'"`,
+		`"newText":"if step > 5 then 1 else 2"`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in LSP response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
 
 
 
