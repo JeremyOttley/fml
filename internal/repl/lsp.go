@@ -159,6 +159,16 @@ type lspCallHierarchyOutgoingCall struct {
 	FromRanges []lspRange           `json:"fromRanges"`
 }
 
+type lspDocumentHighlight struct {
+	Range lspRange `json:"range"`
+	Kind  int      `json:"kind,omitempty"`
+}
+
+type lspSelectionRange struct {
+	Range  lspRange           `json:"range"`
+	Parent *lspSelectionRange `json:"parent,omitempty"`
+}
+
 // NewLSPServer initializes an in-memory LSP server writing responses to out.
 func NewLSPServer(out io.Writer) *LSPServer {
 	return &LSPServer{
@@ -248,6 +258,8 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 				"workspaceSymbolProvider":    true,
 				"foldingRangeProvider":       true,
 				"callHierarchyProvider":      true,
+				"documentHighlightProvider":  true,
+				"selectionRangeProvider":     true,
 				"codeLensProvider": map[string]any{
 					"resolveProvider": false,
 				},
@@ -524,6 +536,30 @@ func (s *LSPServer) HandleJSONRPC(payload []byte) bool {
 		if json.Unmarshal(msg.Params, &params) == nil {
 			calls := s.computeOutgoingCalls(params.Item)
 			s.sendResponse(msg.ID, calls)
+		}
+
+	case "textDocument/documentHighlight":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Position lspPosition `json:"position"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			highlights := s.computeDocumentHighlights(params.TextDocument.URI, params.Position)
+			s.sendResponse(msg.ID, highlights)
+		}
+
+	case "textDocument/selectionRange":
+		var params struct {
+			TextDocument struct {
+				URI string `json:"uri"`
+			} `json:"textDocument"`
+			Positions []lspPosition `json:"positions"`
+		}
+		if json.Unmarshal(msg.Params, &params) == nil {
+			selRanges := s.computeSelectionRanges(params.TextDocument.URI, params.Positions)
+			s.sendResponse(msg.ID, selRanges)
 		}
 
 	case "shutdown":
@@ -1412,6 +1448,40 @@ func (s *LSPServer) computeCodeActions(uri string, rng lspRange) []lspCodeAction
 		}
 	}
 
+	// 3. Extract selected expression to local variable (`refactor.extract`)
+	lines := strings.Split(text, "\n")
+	if rng.Start != rng.End && rng.Start.Line == rng.End.Line && rng.Start.Line >= 0 && rng.Start.Line < len(lines) {
+		line := lines[rng.Start.Line]
+		if rng.Start.Character >= 0 && rng.End.Character <= len(line) && rng.Start.Character < rng.End.Character {
+			sel := strings.TrimSpace(line[rng.Start.Character:rng.End.Character])
+			if sel != "" && !strings.HasPrefix(sel, "let ") && !strings.HasPrefix(sel, "type ") {
+				indentLen := len(line) - len(strings.TrimLeft(line, " \t"))
+				indent := line[:indentLen]
+				actions = append(actions, lspCodeAction{
+					Title: "Extract expression to 'extracted'",
+					Kind:  "refactor.extract",
+					Edit: &lspWorkspaceEdit{
+						Changes: map[string][]lspTextEdit{
+							uri: {
+								{
+									Range: lspRange{
+										Start: lspPosition{Line: rng.Start.Line, Character: 0},
+										End:   lspPosition{Line: rng.Start.Line, Character: 0},
+									},
+									NewText: fmt.Sprintf("%slet extracted = %s\n", indent, sel),
+								},
+								{
+									Range:   rng,
+									NewText: "extracted",
+								},
+							},
+						},
+					},
+				})
+			}
+		}
+	}
+
 	return actions
 }
 
@@ -2119,6 +2189,308 @@ func collectSubtreeIdentCalls(p *parser.Parser, id ast.NodeID, visited map[ast.N
 		collectSubtreeIdentCalls(p, ast.NodeID(n.Left), visited, decl)
 		collectSubtreeIdentCalls(p, ast.NodeID(n.Right), visited, decl)
 	}
+}
+
+func tokenIdxRange(toks []token.Token, idx int, fallbackLen int) lspRange {
+	if idx < 0 || idx >= len(toks) {
+		return lspRange{}
+	}
+	tk := toks[idx]
+	line := max(0, int(tk.Line)-1)
+	col := max(0, int(tk.Col)-1)
+	spanLen := int(tk.End - tk.Start)
+	if spanLen <= 0 {
+		spanLen = fallbackLen
+	}
+	return lspRange{
+		Start: lspPosition{Line: line, Character: col},
+		End:   lspPosition{Line: line, Character: col + spanLen},
+	}
+}
+
+func (s *LSPServer) computeDocumentHighlights(uri string, pos lspPosition) []lspDocumentHighlight {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return []lspDocumentHighlight{}
+	}
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return []lspDocumentHighlight{}
+	}
+
+	toks := p.Tokens()
+	src := p.Source()
+	targetLine := uint16(pos.Line + 1)
+	targetCol := uint16(pos.Character + 1)
+
+	var symName string
+	for _, tk := range toks {
+		if tk.Line == targetLine {
+			spanLen := uint16(tk.End - tk.Start)
+			if spanLen == 0 {
+				spanLen = 1
+			}
+			if targetCol >= tk.Col && targetCol <= tk.Col+spanLen && tk.Kind == token.TokenIdent {
+				symName = string(tk.Slice(src))
+				break
+			}
+		}
+	}
+	if symName == "" {
+		return []lspDocumentHighlight{}
+	}
+
+	writeTokIdxs := make(map[int]bool)
+	symID := p.Arena.Strings.InternString(symName)
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		switch n.Kind {
+		case ast.KindLet, ast.KindLetRec, ast.KindLetMutable, ast.KindUse:
+			if token.StringID(n.Data) == symID {
+				startIdx := int(n.TokenIdx)
+				for i := startIdx; i < len(toks) && i <= startIdx+5; i++ {
+					if toks[i].Kind == token.TokenIdent && string(toks[i].Slice(src)) == symName {
+						writeTokIdxs[i] = true
+						break
+					}
+				}
+			}
+		case ast.KindLambda:
+			if ast.NodeID(n.Left) != ast.NoNode {
+				pn := p.Arena.Get(ast.NodeID(n.Left))
+				if pn.Kind == ast.KindIdent && token.StringID(pn.Data) == symID {
+					writeTokIdxs[int(pn.TokenIdx)] = true
+				}
+			}
+		case ast.KindMutate:
+			if ast.NodeID(n.Left) != ast.NoNode {
+				ln := p.Arena.Get(ast.NodeID(n.Left))
+				if ln.Kind == ast.KindIdent && token.StringID(ln.Data) == symID {
+					writeTokIdxs[int(ln.TokenIdx)] = true
+				}
+			}
+		}
+	}
+
+	var highlights []lspDocumentHighlight
+	for i, tk := range toks {
+		if tk.Kind != token.TokenIdent || string(tk.Slice(src)) != symName {
+			continue
+		}
+		isWrite := writeTokIdxs[i]
+		if !isWrite {
+			for j := i - 1; j >= 0; j-- {
+				if toks[j].Kind <= token.TokenSemi {
+					continue
+				}
+				switch toks[j].Kind {
+				case token.TokenLet, token.TokenMutable, token.TokenRec, token.TokenUse, token.TokenFun, token.TokenFor:
+					isWrite = true
+				}
+				break
+			}
+		}
+		if !isWrite {
+			for j := i + 1; j < len(toks); j++ {
+				if toks[j].Kind <= token.TokenSemi {
+					continue
+				}
+				if toks[j].Kind == token.TokenMutate {
+					isWrite = true
+				}
+				break
+			}
+		}
+		kind := 2 // Read
+		if isWrite {
+			kind = 3 // Write
+		}
+		highlights = append(highlights, lspDocumentHighlight{
+			Range: tokenIdxRange(toks, i, len(symName)),
+			Kind:  kind,
+		})
+	}
+	if highlights == nil {
+		return []lspDocumentHighlight{}
+	}
+	return highlights
+}
+
+func nodeTokenSpan(arena *ast.Arena, toks []token.Token, id ast.NodeID, visited map[ast.NodeID]bool) (int, int) {
+	if id == ast.NoNode || int(id) >= len(arena.Nodes) || visited[id] {
+		return -1, -1
+	}
+	visited[id] = true
+	n := arena.Nodes[id]
+	minT, maxT := -1, -1
+	if n.Kind != ast.KindProgram && n.Kind != ast.KindBlock &&
+		(n.TokenIdx > 0 || id == 1) && int(n.TokenIdx) < len(toks) && toks[n.TokenIdx].Line > 0 {
+		idx := int(n.TokenIdx)
+		minT, maxT = idx, idx
+		if n.Kind == ast.KindLet || n.Kind == ast.KindLetRec || n.Kind == ast.KindLetMutable || n.Kind == ast.KindUse {
+			for j := idx - 1; j >= 0 && j >= idx-3; j-- {
+				if toks[j].Line == toks[idx].Line && (toks[j].Kind == token.TokenLet || toks[j].Kind == token.TokenUse) {
+					minT = j
+					break
+				}
+			}
+		}
+	}
+	merge := func(child ast.NodeID) {
+		cMin, cMax := nodeTokenSpan(arena, toks, child, visited)
+		if cMin >= 0 {
+			if minT < 0 || cMin < minT {
+				minT = cMin
+			}
+			if cMax > maxT {
+				maxT = cMax
+			}
+		}
+	}
+
+	switch n.Kind {
+	case ast.KindProgram, ast.KindBlock, ast.KindTuple, ast.KindList, ast.KindArray,
+		ast.KindRecordLit, ast.KindRecordType, ast.KindDUType, ast.KindPatTuple,
+		ast.KindPatList, ast.KindPatRecord, ast.KindTypeTuple:
+		for _, ch := range arena.ExtraSlice(n.Left, n.Right) {
+			merge(ast.NodeID(ch))
+		}
+	case ast.KindLet, ast.KindLetMutable, ast.KindLetRec, ast.KindUse:
+		if n.Op == 1 {
+			for _, ch := range arena.ExtraSlice(n.Left, 3) {
+				merge(ast.NodeID(ch))
+			}
+		} else {
+			merge(ast.NodeID(n.Left))
+			merge(ast.NodeID(n.Right))
+		}
+	case ast.KindIf:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Right))
+		merge(ast.NodeID(n.Data))
+	case ast.KindMatchArm:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Data))
+		merge(ast.NodeID(n.Right))
+	default:
+		merge(ast.NodeID(n.Left))
+		merge(ast.NodeID(n.Right))
+	}
+	return minT, maxT
+}
+
+func rangeContainsPos(r lspRange, pos lspPosition) bool {
+	if pos.Line < r.Start.Line || pos.Line > r.End.Line {
+		return false
+	}
+	if pos.Line == r.Start.Line && pos.Character < r.Start.Character {
+		return false
+	}
+	if pos.Line == r.End.Line && pos.Character > r.End.Character {
+		return false
+	}
+	return true
+}
+
+func rangeSpanLess(a, b lspRange) bool {
+	aLines := a.End.Line - a.Start.Line
+	bLines := b.End.Line - b.Start.Line
+	if aLines != bLines {
+		return aLines < bLines
+	}
+	aChars := a.End.Character - a.Start.Character
+	bChars := b.End.Character - b.Start.Character
+	if aChars != bChars {
+		return aChars < bChars
+	}
+	if a.Start.Line != b.Start.Line {
+		return a.Start.Line > b.Start.Line
+	}
+	return a.Start.Character > b.Start.Character
+}
+
+func (s *LSPServer) computeSelectionRanges(uri string, positions []lspPosition) []lspSelectionRange {
+	text, ok := s.Docs[uri]
+	if !ok {
+		return []lspSelectionRange{}
+	}
+	p, _, err := parser.ParseSource([]byte(text), nil)
+	if err != nil {
+		return []lspSelectionRange{}
+	}
+	toks := p.Tokens()
+	lines := strings.Split(text, "\n")
+	docRange := lspRange{
+		Start: lspPosition{Line: 0, Character: 0},
+		End:   lspPosition{Line: max(0, len(lines)-1), Character: len(lines[max(0, len(lines)-1)])},
+	}
+
+	var nodeRanges []lspRange
+	for id := 1; id < len(p.Arena.Nodes); id++ {
+		n := p.Arena.Nodes[id]
+		if n.Kind == ast.KindProgram || n.Kind == ast.KindBlock {
+			continue
+		}
+		minT, maxT := nodeTokenSpan(p.Arena, toks, ast.NodeID(id), make(map[ast.NodeID]bool))
+		if minT >= 0 && maxT >= minT {
+			startRng := tokenIdxRange(toks, minT, 1)
+			endRng := tokenIdxRange(toks, maxT, 1)
+			nodeRanges = append(nodeRanges, lspRange{Start: startRng.Start, End: endRng.End})
+		}
+	}
+
+	out := make([]lspSelectionRange, 0, len(positions))
+	for _, pos := range positions {
+		var cands []lspRange
+		targetLine := uint16(pos.Line + 1)
+		targetCol := uint16(pos.Character + 1)
+		for i, tk := range toks {
+			if tk.Kind <= token.TokenSemi {
+				continue
+			}
+			if tk.Line == targetLine {
+				spanLen := uint16(tk.End - tk.Start)
+				if spanLen == 0 {
+					spanLen = 1
+				}
+				if targetCol >= tk.Col && targetCol <= tk.Col+spanLen {
+					cands = append(cands, tokenIdxRange(toks, i, 1))
+					break
+				}
+			}
+		}
+		for _, nr := range nodeRanges {
+			if rangeContainsPos(nr, pos) {
+				cands = append(cands, nr)
+			}
+		}
+		cands = append(cands, docRange)
+
+		sort.Slice(cands, func(i, j int) bool {
+			return rangeSpanLess(cands[i], cands[j])
+		})
+
+		var unique []lspRange
+		for _, r := range cands {
+			if len(unique) == 0 || unique[len(unique)-1] != r {
+				unique = append(unique, r)
+			}
+		}
+
+		var head *lspSelectionRange
+		for i := len(unique) - 1; i >= 0; i-- {
+			head = &lspSelectionRange{
+				Range:  unique[i],
+				Parent: head,
+			}
+		}
+		if head != nil {
+			out = append(out, *head)
+		} else {
+			out = append(out, lspSelectionRange{Range: docRange})
+		}
+	}
+	return out
 }
 
 func (s *LSPServer) sendResponse(id json.RawMessage, result any) {

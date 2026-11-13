@@ -507,5 +507,49 @@ func TestLSPTypeAnnotationAndUnusedBindingCodeActions(t *testing.T) {
 	}
 }
 
+func TestLSPDocumentHighlightSelectionRangeAndExtractAction(t *testing.T) {
+	doc := strings.Join([]string{
+		"let mutable counter = 10",
+		"let bump = counter <- counter + 1",
+		"let total = (counter * 2) + 5",
+	}, "\n") + "\n"
+
+	requests := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///nav.fml","text":%q}}}`, doc),
+		`{"jsonrpc":"2.0","id":2,"method":"textDocument/documentHighlight","params":{"textDocument":{"uri":"file:///nav.fml"},"position":{"line":0,"character":14}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"textDocument/selectionRange","params":{"textDocument":{"uri":"file:///nav.fml"},"positions":[{"line":2,"character":15}]}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///nav.fml"},"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":25}}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"shutdown"}`,
+		`{"jsonrpc":"2.0","method":"exit"}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := RunLSP(strings.NewReader(requests), &out); err != nil {
+		t.Fatalf("RunLSP failed: %v", err)
+	}
+
+	resp := out.String()
+	expected := []string{
+		`"documentHighlightProvider":true`,
+		`"selectionRangeProvider":true`,
+		`{"range":{"start":{"line":0,"character":12},"end":{"line":0,"character":19}},"kind":3}`,
+		`{"range":{"start":{"line":1,"character":11},"end":{"line":1,"character":18}},"kind":3}`,
+		`{"range":{"start":{"line":1,"character":22},"end":{"line":1,"character":29}},"kind":2}`,
+		`{"range":{"start":{"line":2,"character":13},"end":{"line":2,"character":20}},"kind":2}`,
+		`"parent":{"range":{"start":{"line":2,"character":13},"end":{"line":2,"character":24}}`,
+		`"title":"Extract expression to 'extracted'"`,
+		`"kind":"refactor.extract"`,
+		`"newText":"let extracted = (counter * 2)\n"`,
+		`"newText":"extracted"`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(resp, exp) {
+			t.Fatalf("expected %s in LSP response, got:\n%s", exp, resp)
+		}
+	}
+}
+
+
 
 
