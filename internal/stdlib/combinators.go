@@ -1075,20 +1075,155 @@ func registerStringModule(vm *runtime.VM) {
 			return runtime.StringVal{V: s[start:end]}, nil
 		},
 	}
+	strIsEmpty := &runtime.BuiltinVal{
+		Name:  "String.isEmpty",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			s := runtime.Deref(args[0]).(runtime.StringVal).V
+			return runtime.BoolVal{V: len(s) == 0}, nil
+		},
+	}
+	strLastIndexOf := &runtime.BuiltinVal{
+		Name:  "String.lastIndexOf",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			sub := runtime.Deref(args[0]).(runtime.StringVal).V
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			return runtime.IntVal{V: int64(strings.LastIndex(s, sub))}, nil
+		},
+	}
+	strRepeat := &runtime.BuiltinVal{
+		Name:  "String.repeat",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			count := int(runtime.Deref(args[0]).(runtime.IntVal).V)
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			if count <= 0 || len(s) == 0 {
+				return runtime.StringVal{V: ""}, nil
+			}
+			return runtime.StringVal{V: strings.Repeat(s, count)}, nil
+		},
+	}
+	strPadLeft := &runtime.BuiltinVal{
+		Name:  "String.padLeft",
+		Arity: 3,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			width := int(runtime.Deref(args[0]).(runtime.IntVal).V)
+			padStr := runtime.Deref(args[1]).(runtime.StringVal).V
+			s := runtime.Deref(args[2]).(runtime.StringVal).V
+			if len(s) >= width {
+				return runtime.StringVal{V: s}, nil
+			}
+			if padStr == "" {
+				padStr = " "
+			}
+			padUnit := string([]rune(padStr)[0])
+			return runtime.StringVal{V: strings.Repeat(padUnit, width-len(s)) + s}, nil
+		},
+	}
+	strPadRight := &runtime.BuiltinVal{
+		Name:  "String.padRight",
+		Arity: 3,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			width := int(runtime.Deref(args[0]).(runtime.IntVal).V)
+			padStr := runtime.Deref(args[1]).(runtime.StringVal).V
+			s := runtime.Deref(args[2]).(runtime.StringVal).V
+			if len(s) >= width {
+				return runtime.StringVal{V: s}, nil
+			}
+			if padStr == "" {
+				padStr = " "
+			}
+			padUnit := string([]rune(padStr)[0])
+			return runtime.StringVal{V: s + strings.Repeat(padUnit, width-len(s))}, nil
+		},
+	}
+	strLines := &runtime.BuiltinVal{
+		Name:  "String.lines",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			s := strings.ReplaceAll(runtime.Deref(args[0]).(runtime.StringVal).V, "\r\n", "\n")
+			if s == "" {
+				return runtime.EmptyList, nil
+			}
+			parts := strings.Split(s, "\n")
+			vals := make([]runtime.Value, len(parts))
+			for i, p := range parts {
+				vals[i] = runtime.StringVal{V: p}
+			}
+			return runtime.SliceToList(vals), nil
+		},
+	}
+	strRev := &runtime.BuiltinVal{
+		Name:  "String.rev",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			runes := []rune(runtime.Deref(args[0]).(runtime.StringVal).V)
+			for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+				runes[i], runes[j] = runes[j], runes[i]
+			}
+			return runtime.StringVal{V: string(runes)}, nil
+		},
+	}
+	strForall := &runtime.BuiltinVal{
+		Name:  "String.forall",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			for _, r := range s {
+				res, err := vm.Apply(pred, runtime.StringVal{V: string(r)})
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); !ok || !bv.V {
+					return runtime.BoolVal{V: false}, nil
+				}
+			}
+			return runtime.BoolVal{V: true}, nil
+		},
+	}
+	strExists := &runtime.BuiltinVal{
+		Name:  "String.exists",
+		Arity: 2,
+		Fn: func(vm *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			s := runtime.Deref(args[1]).(runtime.StringVal).V
+			for _, r := range s {
+				res, err := vm.Apply(pred, runtime.StringVal{V: string(r)})
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					return runtime.BoolVal{V: true}, nil
+				}
+			}
+			return runtime.BoolVal{V: false}, nil
+		},
+	}
 
 	defineModuleRecord(vm, "String", map[string]runtime.Value{
-		"length":     strLength,
-		"trim":       strTrim,
-		"split":      strSplit,
-		"join":       strJoin,
-		"contains":   strContains,
-		"toUpper":    strToUpper,
-		"toLower":    strToLower,
-		"startsWith": strStartsWith,
-		"endsWith":   strEndsWith,
-		"replace":    strReplace,
-		"indexOf":    strIndexOf,
-		"substring":  strSubstring,
+		"length":      strLength,
+		"isEmpty":     strIsEmpty,
+		"trim":        strTrim,
+		"split":       strSplit,
+		"join":        strJoin,
+		"contains":    strContains,
+		"toUpper":     strToUpper,
+		"toLower":     strToLower,
+		"startsWith":  strStartsWith,
+		"endsWith":    strEndsWith,
+		"replace":     strReplace,
+		"indexOf":     strIndexOf,
+		"lastIndexOf": strLastIndexOf,
+		"substring":   strSubstring,
+		"repeat":      strRepeat,
+		"padLeft":     strPadLeft,
+		"padRight":    strPadRight,
+		"lines":       strLines,
+		"rev":         strRev,
+		"forall":      strForall,
+		"exists":      strExists,
 	})
 }
 

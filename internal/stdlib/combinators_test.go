@@ -325,5 +325,30 @@ else
 	}
 }
 
+func TestStringExtendedCombinators(t *testing.T) {
+	src := `
+let emptyOk = String.isEmpty "" && not (String.isEmpty "fml")
+let lastIdx = String.lastIndexOf "ab" "ab_cd_ab_ef"
+let rep = String.repeat 3 "ha"
+let padL = String.padLeft 5 "0" "42"
+let padR = String.padRight 5 "." "hi"
+let lns = String.lines "alpha\nbeta\ngamma"
+let revS = String.rev "stressed"
+let allLower = String.forall (fun ch -> ch >= "a" && ch <= "z") "fml"
+let hasDigit = String.exists (fun ch -> ch >= "0" && ch <= "9") "v2"
+
+if emptyOk && (rep == "hahaha") && (padL == "00042") && (padR == "hi...") && (revS == "desserts") && allLower && hasDigit then
+    lastIdx + (List.length lns) + (String.length padL)
+else
+    -1
+`
+	val := evalFML(t, src)
+	// lastIdx = 6, List.length lns = 3, String.length padL = 5 -> 14
+	if iv, ok := val.(runtime.IntVal); !ok || iv.V != 14 {
+		t.Fatalf("expected 14 from extended String combinators, got %v", val)
+	}
+}
+
+
 
 

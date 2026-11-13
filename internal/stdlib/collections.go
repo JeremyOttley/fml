@@ -163,6 +163,14 @@ func avlMinNode(n *AVLNode) *AVLNode {
 	return curr
 }
 
+func avlMaxNode(n *AVLNode) *AVLNode {
+	curr := n
+	for curr != nil && curr.Right != nil {
+		curr = curr.Right
+	}
+	return curr
+}
+
 // AVLDelete returns a new persistent AVL tree with key k removed in O(log N)
 // time, leaving the original tree root unmodified.
 func AVLDelete(root *AVLNode, k runtime.Value) *AVLNode {
@@ -429,13 +437,143 @@ func RegisterCollections(vm *runtime.VM) {
 			return state, nil
 		},
 	}
+	mapIsEmpty := &runtime.BuiltinVal{
+		Name:  "Map.isEmpty",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			return runtime.BoolVal{V: unwrapAVL(args[0]) == nil}, nil
+		},
+	}
+	mapExists := &runtime.BuiltinVal{
+		Name:  "Map.exists",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					return runtime.BoolVal{V: true}, nil
+				}
+			}
+			return runtime.BoolVal{V: false}, nil
+		},
+	}
+	mapForall := &runtime.BuiltinVal{
+		Name:  "Map.forall",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); !ok || !bv.V {
+					return runtime.BoolVal{V: false}, nil
+				}
+			}
+			return runtime.BoolVal{V: true}, nil
+		},
+	}
+	mapFindKey := &runtime.BuiltinVal{
+		Name:  "Map.findKey",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					return n.Key, nil
+				}
+			}
+			return nil, fmt.Errorf("Map.findKey: no matching key found")
+		},
+	}
+	mapTryFindKey := &runtime.BuiltinVal{
+		Name:  "Map.tryFindKey",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					tag := v.Prog.Strings.InternString("Some")
+					return runtime.ADTVal{Tag: tag, TagName: "Some", Payload: n.Key}, nil
+				}
+			}
+			tag := v.Prog.Strings.InternString("None")
+			return runtime.ADTVal{Tag: tag, TagName: "None"}, nil
+		},
+	}
+	mapPartition := &runtime.BuiltinVal{
+		Name:  "Map.partition",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var yes, no *AVLNode
+			for _, n := range nodes {
+				partial, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				res, err := v.Apply(partial, n.Val)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					yes = AVLInsert(yes, n.Key, n.Val)
+				} else {
+					no = AVLInsert(no, n.Key, n.Val)
+				}
+			}
+			return runtime.TupleVal{Elems: []runtime.Value{wrapMap(yes), wrapMap(no)}}, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Map", map[string]runtime.Value{
 		"empty":       emptyMap,
+		"isEmpty":     mapIsEmpty,
 		"add":         mapAdd,
 		"remove":      mapRemove,
 		"find":        mapFind,
 		"tryFind":     mapTryFind,
+		"findKey":     mapFindKey,
+		"tryFindKey":  mapTryFindKey,
 		"containsKey": mapContainsKey,
 		"count":       mapCount,
 		"keys":        mapKeys,
@@ -445,6 +583,9 @@ func RegisterCollections(vm *runtime.VM) {
 		"map":         mapMap,
 		"filter":      mapFilter,
 		"fold":        mapFold,
+		"exists":      mapExists,
+		"forall":      mapForall,
+		"partition":   mapPartition,
 	})
 
 	emptySet := wrapSet(nil)
@@ -630,22 +771,134 @@ func RegisterCollections(vm *runtime.VM) {
 			return state, nil
 		},
 	}
+	setIsEmpty := &runtime.BuiltinVal{
+		Name:  "Set.isEmpty",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			return runtime.BoolVal{V: unwrapAVL(args[0]) == nil}, nil
+		},
+	}
+	setIsSuperset := &runtime.BuiltinVal{
+		Name:  "Set.isSuperset",
+		Arity: 2,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			s1 := unwrapAVL(args[0])
+			s2 := unwrapAVL(args[1])
+			var nodes []*AVLNode
+			AVLInOrder(s2, &nodes)
+			for _, n := range nodes {
+				if _, ok := AVLFind(s1, n.Key); !ok {
+					return runtime.BoolVal{V: false}, nil
+				}
+			}
+			return runtime.BoolVal{V: true}, nil
+		},
+	}
+	setExists := &runtime.BuiltinVal{
+		Name:  "Set.exists",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				res, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					return runtime.BoolVal{V: true}, nil
+				}
+			}
+			return runtime.BoolVal{V: false}, nil
+		},
+	}
+	setForall := &runtime.BuiltinVal{
+		Name:  "Set.forall",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			for _, n := range nodes {
+				res, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); !ok || !bv.V {
+					return runtime.BoolVal{V: false}, nil
+				}
+			}
+			return runtime.BoolVal{V: true}, nil
+		},
+	}
+	setPartition := &runtime.BuiltinVal{
+		Name:  "Set.partition",
+		Arity: 2,
+		Fn: func(v *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			pred := runtime.Deref(args[0])
+			var nodes []*AVLNode
+			AVLInOrder(unwrapAVL(args[1]), &nodes)
+			var yes, no *AVLNode
+			for _, n := range nodes {
+				res, err := v.Apply(pred, n.Key)
+				if err != nil {
+					return nil, err
+				}
+				if bv, ok := runtime.Deref(res).(runtime.BoolVal); ok && bv.V {
+					yes = AVLInsert(yes, n.Key, runtime.Unit)
+				} else {
+					no = AVLInsert(no, n.Key, runtime.Unit)
+				}
+			}
+			return runtime.TupleVal{Elems: []runtime.Value{wrapSet(yes), wrapSet(no)}}, nil
+		},
+	}
+	setMinElement := &runtime.BuiltinVal{
+		Name:  "Set.minElement",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			m := avlMinNode(unwrapAVL(args[0]))
+			if m == nil {
+				return nil, fmt.Errorf("Set.minElement: empty set")
+			}
+			return m.Key, nil
+		},
+	}
+	setMaxElement := &runtime.BuiltinVal{
+		Name:  "Set.maxElement",
+		Arity: 1,
+		Fn: func(_ *runtime.VM, args []runtime.Value) (runtime.Value, error) {
+			m := avlMaxNode(unwrapAVL(args[0]))
+			if m == nil {
+				return nil, fmt.Errorf("Set.maxElement: empty set")
+			}
+			return m.Key, nil
+		},
+	}
 
 	defineModuleRecord(vm, "Set", map[string]runtime.Value{
-		"empty":     emptySet,
-		"add":       setAdd,
-		"remove":    setRemove,
-		"contains":  setContains,
-		"count":     setCount,
-		"union":     setUnion,
-		"intersect": setIntersect,
-		"diff":      setDiff,
-		"isSubset":  setIsSubset,
-		"toList":    setToList,
-		"ofList":    setOfList,
-		"map":       setMap,
-		"filter":    setFilter,
-		"fold":      setFold,
+		"empty":      emptySet,
+		"isEmpty":    setIsEmpty,
+		"add":        setAdd,
+		"remove":     setRemove,
+		"contains":   setContains,
+		"count":      setCount,
+		"union":      setUnion,
+		"intersect":  setIntersect,
+		"diff":       setDiff,
+		"isSubset":   setIsSubset,
+		"isSuperset": setIsSuperset,
+		"toList":     setToList,
+		"ofList":     setOfList,
+		"map":        setMap,
+		"filter":     setFilter,
+		"fold":       setFold,
+		"exists":     setExists,
+		"forall":     setForall,
+		"partition":  setPartition,
+		"minElement": setMinElement,
+		"maxElement": setMaxElement,
 	})
 }
 

@@ -119,4 +119,49 @@ mSum + pairsLen + sSum
 	}
 }
 
+func TestMapAndSetPredicatesPartitionAndExtrema(t *testing.T) {
+	src := `
+let m = Map.ofList [(1, 10); (2, 20); (3, 30); (4, 40)]
+let mEmpty = Map.isEmpty Map.empty
+let mNonEmpty = not (Map.isEmpty m)
+let mHas30 = Map.exists (fun _ v -> v == 30) m
+let mAllPos = Map.forall (fun k v -> k > 0 && v > 0) m
+let kFound = Map.findKey (fun _ v -> v >= 25) m
+let kTryFound =
+    match Map.tryFindKey (fun k _ -> k == 4) m with
+    | Some k -> k
+    | None -> 0
+let kTryMissing =
+    match Map.tryFindKey (fun k _ -> k == 99) m with
+    | Some _ -> 1
+    | None -> 0
+let mParts = Map.partition (fun _ v -> v >= 25) m
+let mYes = fst mParts
+let mNo = snd mParts
+
+let s1 = Set.ofList [10; 20; 30; 40]
+let s2 = Set.ofList [20; 30]
+let sEmpty = Set.isEmpty Set.empty
+let sSup = Set.isSuperset s1 s2
+let sHas20 = Set.exists (fun x -> x == 20) s1
+let sAllTens = Set.forall (fun x -> x % 10 == 0) s1
+let sParts = Set.partition (fun x -> x > 20) s1
+let sYes = fst sParts
+let sNo = snd sParts
+let sMin = Set.minElement s1
+let sMax = Set.maxElement s1
+
+if mEmpty && mNonEmpty && mHas30 && mAllPos && sEmpty && sSup && sHas20 && sAllTens && (kTryMissing == 0) then
+    kFound + kTryFound + (Map.count mYes) + (Map.count mNo) + (Set.count sYes) + (Set.count sNo) + sMin + sMax
+else
+    0
+`
+	res := runWithStdlib(t, src)
+	// kFound (3) + kTryFound (4) + Map.count mYes (2) + Map.count mNo (2) + Set.count sYes (2) + Set.count sNo (2) + sMin (10) + sMax (40) = 65
+	if iv, ok := res.(runtime.IntVal); !ok || iv.V != 65 {
+		t.Fatalf("expected 65 from Map/Set predicates, partition, and extrema, got %v", res)
+	}
+}
+
+
 
