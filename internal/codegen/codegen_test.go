@@ -649,4 +649,77 @@ printfn (computeComposite 23 5)
 	}
 }
 
+func TestAOTNativeListAndArraySliceAndLoopSpecialization(t *testing.T) {
+	src := `
+let buildScaledList (n: int) (scale: int) =
+    let raw = List.init n (fun i -> i + 1)
+    let mapped = List.map (fun x -> x * scale) raw
+    List.filter (fun x -> x >= 20) mapped
+
+let computeSlicePipeline (n: int) (scale: int) =
+    let xs = buildScaledList n scale
+    let sumVal = List.sum xs
+    let foldVal = List.fold (fun acc x -> acc + (x / 2)) 0 xs
+    let has40 = List.exists (fun x -> x == 40) xs
+    let allPos = List.forall (fun x -> x > 0) xs
+    let arr = [| 5; 10; 15; 20 |]
+    let arrMapped = Array.map (fun x -> x + 1) arr
+    let arrFolded = Array.fold (fun acc x -> acc + x) 0 arrMapped
+    let firstElem = Array.get arrMapped 0
+    if has40 && allPos then
+        sumVal + foldVal + arrFolded + firstElem + (List.length xs)
+    else
+        0
+
+printfn (computeSlicePipeline 5 10)
+`
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "native_slice_loops.fml")
+	binPath := filepath.Join(tmpDir, "native_slice_loops_bin")
+	if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		t.Fatalf("write source failed: %v", err)
+	}
+
+	prog, err := CompileFile(srcPath)
+	if err != nil {
+		t.Fatalf("CompileFile failed: %v", err)
+	}
+	goSrcBytes, err := EmitGoSource(prog)
+	if err != nil {
+		t.Fatalf("EmitGoSource failed: %v", err)
+	}
+	goSrc := string(goSrcBytes)
+
+	required := []string{
+		"// Native unboxed Go function for buildScaledList",
+		"(p_0 int64, p_1 int64) []int64",
+		"// Native unboxed Go function for computeSlicePipeline",
+		"make([]int64,",
+		"for _, ",
+	}
+	for _, marker := range required {
+		if !strings.Contains(goSrc, marker) {
+			t.Fatalf("expected %q in synthesized AOT Go source, got:\n%s", marker, goSrc)
+		}
+	}
+
+	if err := BuildBinary(srcPath, binPath); err != nil {
+		t.Fatalf("BuildBinary failed: %v", err)
+	}
+	out, err := exec.Command(binPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running compiled binary failed: %v\noutput: %s", err, string(out))
+	}
+	// buildScaledList 5 10 -> raw=[1;2;3;4;5] -> mapped=[10;20;30;40;50] -> xs=[20;30;40;50]
+	// sumVal = 140
+	// foldVal = 10 + 15 + 20 + 25 = 70
+	// arrMapped = [| 6; 11; 16; 21 |] -> arrFolded = 54, firstElem = 6
+	// List.length xs = 4
+	// Total = 140 + 70 + 54 + 6 + 4 = 274
+	if got := strings.TrimSpace(string(out)); got != "274" {
+		t.Fatalf("expected '274', got %q", got)
+	}
+}
+
+
 

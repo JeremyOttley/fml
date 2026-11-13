@@ -484,6 +484,8 @@ const (
 	compTuple
 	compRecord
 	compADT
+	compList
+	compArray
 )
 
 var canonicalPayloadScalars = [...]scalarKind{scalarInt, scalarFloat, scalarBool, scalarString}
@@ -620,8 +622,57 @@ func mergeCompositeShapes(a, b *aotCompositeShape) (*aotCompositeShape, bool) {
 			}
 		}
 		return newADTCompositeShape(mergedTags), true
+
+	case compList, compArray:
+		if len(a.components) != 1 || len(b.components) != 1 {
+			return nil, false
+		}
+		m := joinScalar(a.components[0], b.components[0])
+		if m == scalarConflict {
+			return nil, false
+		}
+		return &aotCompositeShape{kind: a.kind, components: []scalarKind{m}}, true
 	}
 	return nil, false
+}
+
+func isNativeSliceShape(sh *aotCompositeShape) bool {
+	return sh != nil && (sh.kind == compList || sh.kind == compArray) && len(sh.components) == 1 && isNativeScalarKind(sh.components[0])
+}
+
+func goTypeForCompositeComponent(sh *aotCompositeShape, idx int) string {
+	if sh != nil && (sh.kind == compList || sh.kind == compArray) {
+		return "[]" + goTypeForScalar(sh.components[0])
+	}
+	return goTypeForScalar(sh.components[idx])
+}
+
+func zeroLiteralForCompositeComponent(sh *aotCompositeShape, idx int) string {
+	if sh != nil && (sh.kind == compList || sh.kind == compArray) {
+		return fmt.Sprintf("[]%s(nil)", goTypeForScalar(sh.components[0]))
+	}
+	return zeroLiteralForScalar(sh.components[idx])
+}
+
+func resolveLambdaChain(prog *ir.Program, id ir.InstrID, info *aotScalarInfo) ([]ir.InstrID, ir.InstrID, bool) {
+	if prog == nil || id == ir.NoInstr || int(id) >= len(prog.Instrs) {
+		return nil, ir.NoInstr, false
+	}
+	curr := id
+	if prog.Instrs[curr].Kind == ir.IRVar && info != nil {
+		if defID, ok := info.varDef[curr]; ok && defID != ir.NoInstr && int(defID) < len(prog.Instrs) && prog.Instrs[defID].Kind == ir.IRLet {
+			curr = ir.InstrID(prog.Instrs[defID].Arg0)
+		}
+	}
+	var paramDefs []ir.InstrID
+	for curr != ir.NoInstr && int(curr) < len(prog.Instrs) && prog.Instrs[curr].Kind == ir.IRFn {
+		paramDefs = append(paramDefs, curr)
+		curr = ir.InstrID(prog.Instrs[curr].Arg0)
+	}
+	if len(paramDefs) == 0 || curr == ir.NoInstr || int(curr) >= len(prog.Instrs) {
+		return nil, ir.NoInstr, false
+	}
+	return paramDefs, curr, true
 }
 
 type aotNativeFn struct {
@@ -739,6 +790,19 @@ func emitAOTScalarHelpers(buf *bytes.Buffer) {
 	buf.WriteString("func aotAbsInt(x int64) int64 {\n\tif x < 0 {\n\t\treturn -x\n\t}\n\treturn x\n}\n\n")
 	buf.WriteString("func aotMinInt(a, b int64) int64 {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
 	buf.WriteString("func aotMaxInt(a, b int64) int64 {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n")
+	buf.WriteString("func aotRangeInt(start, end int64, flags uint8) []int64 {\n")
+	buf.WriteString("\tif flags != 0 && start >= end {\n")
+	buf.WriteString("\t\tn := int(start - end + 1)\n")
+	buf.WriteString("\t\tout := make([]int64, n)\n")
+	buf.WriteString("\t\tfor i := 0; i < n; i++ {\n\t\t\tout[i] = start - int64(i)\n\t\t}\n")
+	buf.WriteString("\t\treturn out\n")
+	buf.WriteString("\t}\n")
+	buf.WriteString("\tif end < start {\n\t\treturn nil\n\t}\n")
+	buf.WriteString("\tn := int(end - start + 1)\n")
+	buf.WriteString("\tout := make([]int64, n)\n")
+	buf.WriteString("\tfor i := 0; i < n; i++ {\n\t\tout[i] = start + int64(i)\n\t}\n")
+	buf.WriteString("\treturn out\n")
+	buf.WriteString("}\n\n")
 }
 
 func resolveMathSymbol(prog *ir.Program, id ir.InstrID) string {
@@ -946,6 +1010,29 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 						pk := info.instr[ins.Arg0]
 						changed = setCompInstr(id, newADTCompositeShape(map[token.StringID]scalarKind{tag: pk})) || changed
 					}
+
+				case ir.AllocList, ir.AllocArray:
+					cKind := compList
+					if ins.SubOp == ir.AllocArray {
+						cKind = compArray
+					}
+					if ins.Arg1 == 0 {
+						changed = setCompInstr(id, &aotCompositeShape{kind: cKind, components: []scalarKind{scalarUnknown}}) || changed
+					} else if int(ins.Arg0+ins.Arg1) <= len(prog.Extra) {
+						var elemK scalarKind
+						allOK := true
+						for j := uint32(0); j < ins.Arg1; j++ {
+							ch := ir.InstrID(prog.Extra[ins.Arg0+j])
+							if int(ch) >= len(info.instr) || !isNativeScalarKind(info.instr[ch]) {
+								allOK = false
+								break
+							}
+							elemK = joinScalar(elemK, info.instr[ch])
+						}
+						if allOK && isNativeScalarKind(elemK) {
+							changed = setCompInstr(id, &aotCompositeShape{kind: cKind, components: []scalarKind{elemK}}) || changed
+						}
+					}
 				}
 
 			case ir.IRApp:
@@ -1029,6 +1116,119 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 						defKind := info.instr[revArgs[1]]
 						if isNativeScalarKind(defKind) {
 							changed = setInstr(id, defKind) || changed
+						}
+					}
+				case "List.length", "Array.length":
+					if len(revArgs) == 1 {
+						changed = setInstr(id, scalarInt) || changed
+					}
+				case "List.isEmpty":
+					if len(revArgs) == 1 {
+						changed = setInstr(id, scalarBool) || changed
+					}
+				case "List.head":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						changed = setInstr(id, info.compInstr[revArgs[0]].components[0]) || changed
+					}
+				case "List.tail", "List.rev", "Array.rev":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						changed = setInstr(id, scalarConflict) || changed
+						changed = setCompInstr(id, info.compInstr[revArgs[0]]) || changed
+					}
+				case "Array.get":
+					if len(revArgs) == 2 {
+						changed = setInstr(revArgs[0], scalarInt) || changed
+						if int(revArgs[1]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[1]]) {
+							changed = setInstr(id, info.compInstr[revArgs[1]].components[0]) || changed
+						}
+					}
+				case "Array.append":
+					if len(revArgs) == 2 {
+						changed = setInstr(id, scalarConflict) || changed
+						if int(revArgs[1]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[1]]) {
+							changed = setCompInstr(id, info.compInstr[revArgs[1]]) || changed
+						}
+						if int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+							changed = setCompInstr(id, info.compInstr[revArgs[0]]) || changed
+						}
+					}
+				case "Array.ofList":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						changed = setInstr(id, scalarConflict) || changed
+						changed = setCompInstr(id, &aotCompositeShape{kind: compArray, components: info.compInstr[revArgs[0]].components}) || changed
+					}
+				case "Array.toList":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						changed = setInstr(id, scalarConflict) || changed
+						changed = setCompInstr(id, &aotCompositeShape{kind: compList, components: info.compInstr[revArgs[0]].components}) || changed
+					}
+				case "List.sum":
+					if len(revArgs) == 1 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						ek := info.compInstr[revArgs[0]].components[0]
+						if ek == scalarInt || ek == scalarFloat {
+							changed = setInstr(id, ek) || changed
+						}
+					}
+				case "List.init", "Array.init":
+					if len(revArgs) == 2 {
+						changed = setInstr(revArgs[1], scalarInt) || changed
+						if pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[0], info); okL && len(pDefs) == 1 {
+							changed = setDef(pDefs[0], scalarInt) || changed
+							if int(bodyID) < len(info.instr) && isNativeScalarKind(info.instr[bodyID]) {
+								outKind := compList
+								if resolveMathSymbol(prog, spine) == "Array.init" {
+									outKind = compArray
+								}
+								changed = setInstr(id, scalarConflict) || changed
+								changed = setCompInstr(id, &aotCompositeShape{kind: outKind, components: []scalarKind{info.instr[bodyID]}}) || changed
+							}
+						}
+					}
+				case "List.map", "Array.map":
+					if len(revArgs) == 2 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						inSh := info.compInstr[revArgs[0]]
+						if pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], info); okL && len(pDefs) == 1 {
+							changed = setDef(pDefs[0], inSh.components[0]) || changed
+							if int(bodyID) < len(info.instr) && isNativeScalarKind(info.instr[bodyID]) {
+								outKind := compList
+								if resolveMathSymbol(prog, spine) == "Array.map" {
+									outKind = compArray
+								}
+								changed = setInstr(id, scalarConflict) || changed
+								changed = setCompInstr(id, &aotCompositeShape{kind: outKind, components: []scalarKind{info.instr[bodyID]}}) || changed
+							}
+						}
+					}
+				case "List.filter", "Array.filter":
+					if len(revArgs) == 2 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						inSh := info.compInstr[revArgs[0]]
+						if pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], info); okL && len(pDefs) == 1 {
+							changed = setDef(pDefs[0], inSh.components[0]) || changed
+							changed = setInstr(bodyID, scalarBool) || changed
+							changed = setInstr(id, scalarConflict) || changed
+							changed = setCompInstr(id, inSh) || changed
+						}
+					}
+				case "List.fold", "Array.fold":
+					if len(revArgs) == 3 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) && int(revArgs[1]) < len(info.instr) {
+						inSh := info.compInstr[revArgs[0]]
+						accK := info.instr[revArgs[1]]
+						if isNativeScalarKind(accK) {
+							if pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[2], info); okL && len(pDefs) == 2 {
+								changed = setDef(pDefs[0], accK) || changed
+								changed = setDef(pDefs[1], inSh.components[0]) || changed
+								changed = setInstr(bodyID, accK) || changed
+								changed = setInstr(id, accK) || changed
+							}
+						}
+					}
+				case "List.exists", "Array.exists", "List.forall", "Array.forall":
+					if len(revArgs) == 2 && int(revArgs[0]) < len(info.compInstr) && isNativeSliceShape(info.compInstr[revArgs[0]]) {
+						inSh := info.compInstr[revArgs[0]]
+						if pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], info); okL && len(pDefs) == 1 {
+							changed = setDef(pDefs[0], inSh.components[0]) || changed
+							changed = setInstr(bodyID, scalarBool) || changed
+							changed = setInstr(id, scalarBool) || changed
 						}
 					}
 				}
@@ -1129,6 +1329,15 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 							} else if pk := sh.singleADTPayloadKind(); isNativeScalarKind(pk) {
 								changed = setInstr(id, pk) || changed
 							}
+						}
+					case ir.LoadListHead:
+						if sh.kind == compList && isNativeSliceShape(sh) {
+							changed = setInstr(id, sh.components[0]) || changed
+						}
+					case ir.LoadListTail:
+						if sh.kind == compList && isNativeSliceShape(sh) {
+							changed = setInstr(id, scalarConflict) || changed
+							changed = setCompInstr(id, sh) || changed
 						}
 					}
 				}
@@ -1248,6 +1457,28 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 							changed = setInstr(arg1, opKind) || changed
 						}
 					}
+				case ir.PrimCons:
+					changed = setInstr(id, scalarConflict) || changed
+					if int(arg0) < len(info.instr) && isNativeScalarKind(info.instr[arg0]) {
+						sh := &aotCompositeShape{kind: compList, components: []scalarKind{info.instr[arg0]}}
+						changed = setCompInstr(id, sh) || changed
+						changed = setCompInstr(arg1, sh) || changed
+					}
+				case ir.PrimAppend:
+					changed = setInstr(id, scalarConflict) || changed
+					if int(arg0) < len(info.compInstr) && isNativeSliceShape(info.compInstr[arg0]) {
+						changed = setCompInstr(id, info.compInstr[arg0]) || changed
+						changed = setCompInstr(arg1, info.compInstr[arg0]) || changed
+					}
+					if int(arg1) < len(info.compInstr) && isNativeSliceShape(info.compInstr[arg1]) {
+						changed = setCompInstr(id, info.compInstr[arg1]) || changed
+						changed = setCompInstr(arg0, info.compInstr[arg1]) || changed
+					}
+				case ir.PrimRange:
+					changed = setInstr(id, scalarConflict) || changed
+					changed = setInstr(arg0, scalarInt) || changed
+					changed = setInstr(arg1, scalarInt) || changed
+					changed = setCompInstr(id, &aotCompositeShape{kind: compList, components: []scalarKind{scalarInt}}) || changed
 				}
 			}
 		}
@@ -1260,6 +1491,9 @@ func analyzeAOTScalars(prog *ir.Program) *aotScalarInfo {
 	for letID, sig := range fnSigs {
 		retKind := info.instr[sig.bodyID]
 		retComp := info.compInstr[sig.bodyID]
+		if retComp != nil && (retComp.kind == compList || retComp.kind == compArray) && !isNativeSliceShape(retComp) {
+			retComp = nil
+		}
 		if !isNativeScalarKind(retKind) && retComp == nil {
 			continue
 		}
@@ -1422,6 +1656,9 @@ func boxScalarExpr(k scalarKind, expr string) string {
 
 func goReturnTypeForFn(fn *aotNativeFn) string {
 	if fn.retComp != nil {
+		if fn.retComp.kind == compList || fn.retComp.kind == compArray {
+			return goTypeForCompositeComponent(fn.retComp, 0)
+		}
 		parts := make([]string, len(fn.retComp.components))
 		for i, ck := range fn.retComp.components {
 			parts[i] = goTypeForScalar(ck)
@@ -1651,8 +1888,8 @@ func emitNativeBlock(prog *ir.Program, id ir.InstrID, retKind scalarKind, retCom
 			if isIgnorableSwitchBranch(prog, ir.InstrID(ins.Aux)) {
 				if retComp != nil {
 					zeros := make([]string, len(retComp.components))
-					for i, ck := range retComp.components {
-						zeros[i] = zeroLiteralForScalar(ck)
+					for i := range retComp.components {
+						zeros[i] = zeroLiteralForCompositeComponent(retComp, i)
 					}
 					dCode = fmt.Sprintf("\treturn %s\n", strings.Join(zeros, ", "))
 				} else {
@@ -1767,8 +2004,8 @@ func emitNativeCompositeDecl(prog *ir.Program, id ir.InstrID, wantShape *aotComp
 		return fmt.Sprintf("\t%s := %s\n", strings.Join(targetVars, ", "), strings.Join(exprs, ", ")), true
 	}
 	var sb strings.Builder
-	for i, ck := range wantShape.components {
-		fmt.Fprintf(&sb, "\tvar %s %s\n", targetVars[i], goTypeForScalar(ck))
+	for i := range wantShape.components {
+		fmt.Fprintf(&sb, "\tvar %s %s\n", targetVars[i], goTypeForCompositeComponent(wantShape, i))
 	}
 	assignCode, ok := emitNativeCompositeAssign(prog, id, wantShape, targetVars, scalars, candidates, localVars, compVars)
 	if !ok {
@@ -2011,9 +2248,172 @@ func nativeCompositeExprs(prog *ir.Program, id ir.InstrID, wantShape *aotComposi
 				out[slot] = pExpr
 			}
 			return out, true
+
+		case ir.AllocList, ir.AllocArray:
+			if !isNativeSliceShape(wantShape) || int(ins.Arg0+ins.Arg1) > len(prog.Extra) {
+				return nil, false
+			}
+			if (ins.SubOp == ir.AllocList && wantShape.kind != compList) || (ins.SubOp == ir.AllocArray && wantShape.kind != compArray) {
+				return nil, false
+			}
+			elemK := wantShape.components[0]
+			elemGoTy := goTypeForScalar(elemK)
+			elems := make([]string, ins.Arg1)
+			for i := uint32(0); i < ins.Arg1; i++ {
+				ch := ir.InstrID(prog.Extra[ins.Arg0+i])
+				e, ok := nativeScalarExpr(prog, ch, elemK, scalars, candidates, localVars, compVars)
+				if !ok {
+					return nil, false
+				}
+				elems[i] = e
+			}
+			return []string{fmt.Sprintf("[]%s{%s}", elemGoTy, strings.Join(elems, ", "))}, true
+		}
+
+	case ir.IRPrim:
+		if !isNativeSliceShape(wantShape) || wantShape.kind != compList {
+			return nil, false
+		}
+		elemK := wantShape.components[0]
+		elemGoTy := goTypeForScalar(elemK)
+		switch ins.SubOp {
+		case ir.PrimCons:
+			hExpr, okH := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), elemK, scalars, candidates, localVars, compVars)
+			tExpr, okT := nativeSliceExpr(prog, ir.InstrID(ins.Arg1), wantShape, scalars, candidates, localVars, compVars)
+			if okH && okT {
+				return []string{fmt.Sprintf("append([]%s{%s}, %s...)", elemGoTy, hExpr, tExpr)}, true
+			}
+		case ir.PrimAppend:
+			lExpr, okL := nativeSliceExpr(prog, ir.InstrID(ins.Arg0), wantShape, scalars, candidates, localVars, compVars)
+			rExpr, okR := nativeSliceExpr(prog, ir.InstrID(ins.Arg1), wantShape, scalars, candidates, localVars, compVars)
+			if okL && okR {
+				return []string{fmt.Sprintf("append(append([]%s(nil), %s...), %s...)", elemGoTy, lExpr, rExpr)}, true
+			}
+		case ir.PrimRange:
+			if elemK == scalarInt {
+				sExpr, okS := nativeScalarExpr(prog, ir.InstrID(ins.Arg0), scalarInt, scalars, candidates, localVars, compVars)
+				eExpr, okE := nativeScalarExpr(prog, ir.InstrID(ins.Arg1), scalarInt, scalars, candidates, localVars, compVars)
+				if okS && okE {
+					return []string{fmt.Sprintf("aotRangeInt(%s, %s, %d)", sExpr, eExpr, ins.Flags)}, true
+				}
+			}
+		}
+
+	case ir.IRLoad:
+		if ins.SubOp == ir.LoadListTail && isNativeSliceShape(wantShape) && wantShape.kind == compList {
+			if srcExpr, okS := nativeSliceExpr(prog, ir.InstrID(ins.Arg0), wantShape, scalars, candidates, localVars, compVars); okS {
+				return []string{fmt.Sprintf("%s[1:]", srcExpr)}, true
+			}
+		}
+
+	case ir.IRApp:
+		if !isNativeSliceShape(wantShape) {
+			return nil, false
+		}
+		elemK := wantShape.components[0]
+		elemGoTy := goTypeForScalar(elemK)
+		var revArgs []ir.InstrID
+		spine := id
+		for spine != ir.NoInstr && int(spine) < len(prog.Instrs) && prog.Instrs[spine].Kind == ir.IRApp {
+			revArgs = append(revArgs, ir.InstrID(prog.Instrs[spine].Arg1))
+			spine = ir.InstrID(prog.Instrs[spine].Arg0)
+		}
+		switch mathSym := resolveMathSymbol(prog, spine); mathSym {
+		case "List.tail":
+			if wantShape.kind == compList && len(revArgs) == 1 {
+				if srcExpr, okS := nativeSliceExpr(prog, revArgs[0], wantShape, scalars, candidates, localVars, compVars); okS {
+					return []string{fmt.Sprintf("%s[1:]", srcExpr)}, true
+				}
+			}
+		case "List.rev", "Array.rev":
+			if len(revArgs) == 1 {
+				if srcExpr, okS := nativeSliceExpr(prog, revArgs[0], wantShape, scalars, candidates, localVars, compVars); okS {
+					return []string{fmt.Sprintf("func() []%s { s := %s; out := make([]%s, len(s)); for i := range s { out[len(s)-1-i] = s[i] }; return out }()", elemGoTy, srcExpr, elemGoTy)}, true
+				}
+			}
+		case "Array.append":
+			if wantShape.kind == compArray && len(revArgs) == 2 {
+				lExpr, okL := nativeSliceExpr(prog, revArgs[1], wantShape, scalars, candidates, localVars, compVars)
+				rExpr, okR := nativeSliceExpr(prog, revArgs[0], wantShape, scalars, candidates, localVars, compVars)
+				if okL && okR {
+					return []string{fmt.Sprintf("append(append([]%s(nil), %s...), %s...)", elemGoTy, lExpr, rExpr)}, true
+				}
+			}
+		case "Array.ofList":
+			if wantShape.kind == compArray && len(revArgs) == 1 {
+				listShape := &aotCompositeShape{kind: compList, components: wantShape.components}
+				if srcExpr, okS := nativeSliceExpr(prog, revArgs[0], listShape, scalars, candidates, localVars, compVars); okS {
+					return []string{srcExpr}, true
+				}
+			}
+		case "Array.toList":
+			if wantShape.kind == compList && len(revArgs) == 1 {
+				arrShape := &aotCompositeShape{kind: compArray, components: wantShape.components}
+				if srcExpr, okS := nativeSliceExpr(prog, revArgs[0], arrShape, scalars, candidates, localVars, compVars); okS {
+					return []string{srcExpr}, true
+				}
+			}
+		case "List.init", "Array.init":
+			if len(revArgs) == 2 {
+				cntExpr, okC := nativeScalarExpr(prog, revArgs[1], scalarInt, scalars, candidates, localVars, compVars)
+				pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[0], scalars)
+				if okC && okL && len(pDefs) == 1 {
+					idxVar := fmt.Sprintf("idx_%d", id)
+					loopVars := cloneLocalVars(localVars)
+					loopVars[pDefs[0]] = idxVar
+					if bodyExpr, okB := nativeScalarExpr(prog, bodyID, elemK, scalars, candidates, loopVars, compVars); okB {
+						return []string{fmt.Sprintf("func() []%s { n := int(%s); if n <= 0 { return nil }; out := make([]%s, n); for i := 0; i < n; i++ { %s := int64(i); _ = %s; out[i] = %s }; return out }()", elemGoTy, cntExpr, elemGoTy, idxVar, idxVar, bodyExpr)}, true
+					}
+				}
+			}
+		case "List.map", "Array.map":
+			if len(revArgs) == 2 && int(revArgs[0]) < len(scalars.compInstr) && isNativeSliceShape(scalars.compInstr[revArgs[0]]) {
+				inShape := scalars.compInstr[revArgs[0]]
+				srcExpr, okS := nativeSliceExpr(prog, revArgs[0], inShape, scalars, candidates, localVars, compVars)
+				pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], scalars)
+				if okS && okL && len(pDefs) == 1 {
+					elemVar := fmt.Sprintf("elem_%d", id)
+					loopVars := cloneLocalVars(localVars)
+					loopVars[pDefs[0]] = elemVar
+					if bodyExpr, okB := nativeScalarExpr(prog, bodyID, elemK, scalars, candidates, loopVars, compVars); okB {
+						return []string{fmt.Sprintf("func() []%s { src := %s; out := make([]%s, len(src)); for i, %s := range src { out[i] = %s }; return out }()", elemGoTy, srcExpr, elemGoTy, elemVar, bodyExpr)}, true
+					}
+				}
+			}
+		case "List.filter", "Array.filter":
+			if len(revArgs) == 2 {
+				srcExpr, okS := nativeSliceExpr(prog, revArgs[0], wantShape, scalars, candidates, localVars, compVars)
+				pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], scalars)
+				if okS && okL && len(pDefs) == 1 {
+					elemVar := fmt.Sprintf("elem_%d", id)
+					loopVars := cloneLocalVars(localVars)
+					loopVars[pDefs[0]] = elemVar
+					if predExpr, okP := nativeScalarExpr(prog, bodyID, scalarBool, scalars, candidates, loopVars, compVars); okP {
+						return []string{fmt.Sprintf("func() []%s { src := %s; out := make([]%s, 0, len(src)); for _, %s := range src { if %s { out = append(out, %s) } }; return out }()", elemGoTy, srcExpr, elemGoTy, elemVar, predExpr, elemVar)}, true
+					}
+				}
+			}
 		}
 	}
 	return nil, false
+}
+
+func nativeSliceExpr(prog *ir.Program, id ir.InstrID, wantShape *aotCompositeShape, scalars *aotScalarInfo, candidates map[ir.InstrID]*aotNativeFn, localVars map[ir.InstrID]string, compVars map[ir.InstrID][]string) (string, bool) {
+	if !isNativeSliceShape(wantShape) {
+		return "", false
+	}
+	if callExpr, ok := nativeCompositeCallExpr(prog, id, wantShape, scalars, candidates, localVars, compVars); ok {
+		return callExpr, true
+	}
+	if exprs, ok := nativeCompositeExprs(prog, id, wantShape, scalars, candidates, localVars, compVars); ok && len(exprs) == 1 {
+		return exprs[0], true
+	}
+	tmpVars := []string{fmt.Sprintf("tmp_slice_%d", id)}
+	declCode, ok := emitNativeCompositeDecl(prog, id, wantShape, tmpVars, scalars, candidates, localVars, compVars)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf("func() %s {\n%s\treturn %s\n}()", goTypeForCompositeComponent(wantShape, 0), declCode, tmpVars[0]), true
 }
 
 func nativeScalarFromCompositeSlot(prog *ir.Program, srcID ir.InstrID, srcShape *aotCompositeShape, slot int, wantKind scalarKind, scalars *aotScalarInfo, candidates map[ir.InstrID]*aotNativeFn, localVars map[ir.InstrID]string, compVars map[ir.InstrID][]string) (string, bool) {
@@ -2138,6 +2538,18 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 						if e, ok := nativeScalarFromCompositeSlot(prog, srcID, sh, slot, wantKind, scalars, candidates, localVars, cVars); ok {
 							return e, true
 						}
+					}
+				}
+			case ir.LoadListHead:
+				if sh.kind == compList && isNativeSliceShape(sh) && sh.components[0] == wantKind {
+					if sExpr, okS := nativeSliceExpr(prog, srcID, sh, scalars, candidates, localVars, cVars); okS {
+						return fmt.Sprintf("%s[0]", sExpr), true
+					}
+				}
+			case ir.LoadListIsEmpty:
+				if sh.kind == compList && isNativeSliceShape(sh) && wantKind == scalarInt {
+					if sExpr, okS := nativeSliceExpr(prog, srcID, sh, scalars, candidates, localVars, cVars); okS {
+						return fmt.Sprintf("func() int64 { if len(%s) == 0 { return 1 }; return 0 }()", sExpr), true
 					}
 				}
 			}
@@ -2357,6 +2769,86 @@ func nativeScalarExpr(prog *ir.Program, id ir.InstrID, wantKind scalarKind, scal
 								fmt.Fprintf(&sb, "\tif %s == int64(%d) {\n\t\treturn %s\n\t}\n\treturn %s\n}()", tmpVars[0], tagID, tmpVars[slot], defExpr)
 								return sb.String(), true
 							}
+						}
+					}
+				}
+			}
+		case "List.length", "Array.length":
+			if wantKind == scalarInt && len(revArgs) == 1 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) {
+					if sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars); okS {
+						return fmt.Sprintf("int64(len(%s))", sExpr), true
+					}
+				}
+			}
+		case "List.isEmpty":
+			if wantKind == scalarBool && len(revArgs) == 1 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) {
+					if sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars); okS {
+						return fmt.Sprintf("(len(%s) == 0)", sExpr), true
+					}
+				}
+			}
+		case "List.head":
+			if len(revArgs) == 1 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) && sh.components[0] == wantKind {
+					if sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars); okS {
+						return fmt.Sprintf("%s[0]", sExpr), true
+					}
+				}
+			}
+		case "Array.get":
+			if len(revArgs) == 2 && int(revArgs[1]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[1]]; isNativeSliceShape(sh) && sh.components[0] == wantKind {
+					sExpr, okS := nativeSliceExpr(prog, revArgs[1], sh, scalars, candidates, localVars, cVars)
+					idxExpr, okI := nativeScalarExpr(prog, revArgs[0], scalarInt, scalars, candidates, localVars, cVars)
+					if okS && okI {
+						return fmt.Sprintf("%s[%s]", sExpr, idxExpr), true
+					}
+				}
+			}
+		case "List.sum":
+			if (wantKind == scalarInt || wantKind == scalarFloat) && len(revArgs) == 1 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) && sh.components[0] == wantKind {
+					if sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars); okS {
+						goTy := goTypeForScalar(wantKind)
+						return fmt.Sprintf("func() %s { var acc %s; for _, v := range %s { acc += v }; return acc }()", goTy, goTy, sExpr), true
+					}
+				}
+			}
+		case "List.fold", "Array.fold":
+			if len(revArgs) == 3 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) {
+					sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars)
+					initExpr, okI := nativeScalarExpr(prog, revArgs[1], wantKind, scalars, candidates, localVars, cVars)
+					pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[2], scalars)
+					if okS && okI && okL && len(pDefs) == 2 {
+						accVar := fmt.Sprintf("acc_%d", id)
+						elemVar := fmt.Sprintf("elem_%d", id)
+						loopVars := cloneLocalVars(localVars)
+						loopVars[pDefs[0]] = accVar
+						loopVars[pDefs[1]] = elemVar
+						if stepExpr, okB := nativeScalarExpr(prog, bodyID, wantKind, scalars, candidates, loopVars, cVars); okB {
+							goTy := goTypeForScalar(wantKind)
+							return fmt.Sprintf("func() %s { %s := %s; for _, %s := range %s { %s = %s }; return %s }()", goTy, accVar, initExpr, elemVar, sExpr, accVar, stepExpr, accVar), true
+						}
+					}
+				}
+			}
+		case "List.exists", "Array.exists", "List.forall", "Array.forall":
+			if wantKind == scalarBool && len(revArgs) == 2 && int(revArgs[0]) < len(scalars.compInstr) {
+				if sh := scalars.compInstr[revArgs[0]]; isNativeSliceShape(sh) {
+					sExpr, okS := nativeSliceExpr(prog, revArgs[0], sh, scalars, candidates, localVars, cVars)
+					pDefs, bodyID, okL := resolveLambdaChain(prog, revArgs[1], scalars)
+					if okS && okL && len(pDefs) == 1 {
+						elemVar := fmt.Sprintf("elem_%d", id)
+						loopVars := cloneLocalVars(localVars)
+						loopVars[pDefs[0]] = elemVar
+						if predExpr, okP := nativeScalarExpr(prog, bodyID, scalarBool, scalars, candidates, loopVars, cVars); okP {
+							if mathSym == "List.exists" || mathSym == "Array.exists" {
+								return fmt.Sprintf("func() bool { for _, %s := range %s { if %s { return true } }; return false }()", elemVar, sExpr, predExpr), true
+							}
+							return fmt.Sprintf("func() bool { for _, %s := range %s { if !(%s) { return false } }; return true }()", elemVar, sExpr, predExpr), true
 						}
 					}
 				}
@@ -2775,6 +3267,26 @@ func unboxedCompositeCallValueExpr(prog *ir.Program, id ir.InstrID, scalars *aot
 			}
 		}
 		sb.WriteString("\tdefault:\n\t\treturn runtime.Unit\n\t}\n}()")
+		return sb.String(), true
+
+	case compList:
+		if !isNativeSliceShape(sh) {
+			return "", false
+		}
+		elemK := sh.components[0]
+		fmt.Fprintf(&sb, "\telems := make([]runtime.Value, len(%s))\n", tmpVars[0])
+		fmt.Fprintf(&sb, "\tfor i, v := range %s {\n\t\telems[i] = %s\n\t}\n", tmpVars[0], boxScalarExpr(elemK, "v"))
+		sb.WriteString("\treturn runtime.SliceToList(elems)\n}()")
+		return sb.String(), true
+
+	case compArray:
+		if !isNativeSliceShape(sh) {
+			return "", false
+		}
+		elemK := sh.components[0]
+		fmt.Fprintf(&sb, "\telems := make([]runtime.Value, len(%s))\n", tmpVars[0])
+		fmt.Fprintf(&sb, "\tfor i, v := range %s {\n\t\telems[i] = %s\n\t}\n", tmpVars[0], boxScalarExpr(elemK, "v"))
+		sb.WriteString("\treturn &runtime.ArrayVal{Elems: elems}\n}()")
 		return sb.String(), true
 	}
 	return "", false
