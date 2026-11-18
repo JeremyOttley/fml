@@ -7,3 +7,45 @@
 # Coverage and profiling
 *.cov
 *.prof
+
+# HTML reports and documents
+*.html
+*.htm
+
+# Markdown files (ignore all except README and documentation)
+*.md
+*.markdown
+!README.md
+!STDLIB.md
+!docs/
+!docs/**/*.md
+!doc/
+!doc/**/*.md
+
+# Agent guidance and configuration files
+AGENTS.md
+AGENT.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+COPILOT.md
+PLAN.md
+plan.md
+PROJECT_PLAN_PROMPT.md
+f_language_elements.md
+*PROMPT*.md
+*prompt*.md
+.agent/
+.agents/
+.claude/
+.gemini/
+.cursor/
+.cursorrules
+.cursorignore
+.windsurf/
+.windsurfrules
+.clinerules
+.roorules
+.aider*
+.openhands/
+.github/copilot-instructions.md
